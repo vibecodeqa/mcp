@@ -38,7 +38,7 @@ npx @vibecodeqa/mcp
 | Tool | Description |
 |------|-------------|
 | `vcqa_score` | Quick score + grade + check summary (uses cache) |
-| `vcqa_scan` | Full scan — all 24 checks with issues and details |
+| `vcqa_scan` | Full scan — all 25 checks with issues and details |
 | `vcqa_file_health` | Issues for a specific file (use before/after editing) |
 | `vcqa_check` | Detailed results for one check (e.g., "complexity") |
 | `vcqa_explain` | What a check measures, why it matters, how to fix |
