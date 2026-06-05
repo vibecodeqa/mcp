@@ -4,11 +4,12 @@
  *
  * Gives AI coding agents real-time code health context.
  * Tools:
- *   vcqa_scan        — Run a full scan, get score + grade + all check results
+ *   vcqa_score       — Quick score + grade (fastest, uses cache)
+ *   vcqa_scan        — Full scan with all 25 check results
  *   vcqa_file_health — Get issues for a specific file
- *   vcqa_check       — Get details for a specific check (e.g., "complexity")
- *   vcqa_score       — Quick score + grade (fastest)
+ *   vcqa_check       — Get details for a specific check
  *   vcqa_explain     — Explain what a check measures and how to fix it
+ *   vcqa_fix         — AI-powered fix for code issues (needs ANTHROPIC_API_KEY)
  *
  * Usage:
  *   npx @vibecodeqa/mcp                  # stdio transport (for Claude Code, Cursor, etc.)
@@ -17,7 +18,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -26,9 +27,46 @@ import { z } from "zod";
 interface ScanReport {
 	score: number;
 	grade: string;
-	checks: { name: string; score: number; grade: string; details: Record<string, unknown>; issues: { severity: string; message: string; file?: string; line?: number; rule?: string }[] }[];
+	version?: string;
+	checks: {
+		name: string;
+		score: number;
+		grade: string;
+		details: Record<string, unknown>;
+		issues: { severity: string; message: string; file?: string; line?: number; rule?: string }[];
+		duration: number;
+	}[];
 	meta: Record<string, unknown>;
 }
+
+// Check metadata — embedded to avoid shelling out for explain
+const CHECK_META: Record<string, { label: string; category: string; weight: number; description: string; risk: string; recommendation: string }> = {
+	structure: { label: "Project Structure", category: "Foundations", weight: 6, description: "Checks for standard project files: package.json, tsconfig.json, LICENSE, README, .gitignore, lockfile. Verifies test-to-source ratio.", risk: "Missing config files cause build failures in CI. No lockfile means non-reproducible builds.", recommendation: "Ensure every project has package.json, tsconfig.json, LICENSE, .gitignore, and a lockfile." },
+	lint: { label: "Lint", category: "Foundations", weight: 5, description: "Runs the project's linter (Biome or ESLint) and counts errors and warnings.", risk: "Unlinted code accumulates inconsistencies and latent bugs.", recommendation: "Fix all lint errors. Add Biome if no linter configured." },
+	types: { label: "Type Check", category: "Foundations", weight: 6, description: "Runs tsc --noEmit to find TypeScript compilation errors.", risk: "Type errors are bugs — every unresolved error is a potential runtime crash.", recommendation: "Fix all type errors. Enable strict mode." },
+	"type-safety": { label: "Type Safety", category: "Foundations", weight: 3, description: "Counts unsafe type patterns: 'as any', ': any', @ts-ignore, non-null assertions.", risk: "'as any' silences the type checker. Accumulated any usage correlates with higher defect density.", recommendation: "Replace 'as any' with proper types or type guards." },
+	standards: { label: "Code Standards", category: "Foundations", weight: 3, description: "Checks naming conventions, file size, code smells (console.log, var, ==, eval).", risk: "Large files are hard to review. console.log in production leaks data.", recommendation: "Split files over 300 lines. Use const/let, ===, and safe DOM APIs." },
+	complexity: { label: "Complexity", category: "Quality", weight: 5, description: "Measures cognitive complexity per function.", risk: "Complex functions are the #1 source of bugs.", recommendation: "Extract complex functions into smaller ones. Use early returns." },
+	duplication: { label: "Duplication", category: "Quality", weight: 5, description: "Detects copy-pasted code blocks of 6+ lines.", risk: "Duplicated code means bugs must be fixed in multiple places.", recommendation: "Extract duplicated logic into shared functions." },
+	"error-handling": { label: "Error Handling", category: "Quality", weight: 3, description: "Detects empty catch, throw string, floating promises, unsafe JSON.parse.", risk: "Empty catch blocks silently swallow errors.", recommendation: "Handle or log every catch. Use throw new Error()." },
+	react: { label: "React Patterns", category: "Quality", weight: 3, description: "Checks conditional hooks, missing keys, index as key, prop spreading.", risk: "Conditional hooks crash React. Missing keys cause incorrect reconciliation.", recommendation: "Never call hooks inside conditions. Always provide stable keys." },
+	accessibility: { label: "Accessibility", category: "Quality", weight: 4, description: "Checks img alt, click handlers without keyboard, unlabeled forms.", risk: "1 in 4 adults has a disability.", recommendation: "Add alt text. Use <button> for clickable elements." },
+	docs: { label: "Documentation", category: "Quality", weight: 3, description: "Checks README quality and JSDoc coverage.", risk: "Undocumented code is hard to onboard to.", recommendation: "Write README with install/usage. Add JSDoc to public exports." },
+	"best-practices": { label: "Best Practices", category: "Quality", weight: 3, description: "CI/CD, supply chain, OIDC, pinned actions, SECURITY.md, CODEOWNERS.", risk: "Missing CI practices lead to supply chain attacks.", recommendation: "Pin actions to SHA. Use OIDC. Add SECURITY.md." },
+	testing: { label: "Testing", category: "Testing", weight: 15, description: "Test pyramid, execution, coverage, file pairing, quality metrics.", risk: "Code without tests is code you can't safely change.", recommendation: "Follow testing pyramid. Aim for >80% branch coverage." },
+	secrets: { label: "Secrets", category: "Security", weight: 6, description: "Scans for hardcoded secrets: AWS, GitHub, Stripe, OpenAI keys. Delegates to gitleaks.", risk: "Hardcoded secrets are the #1 cause of credential leaks.", recommendation: "Use environment variables or a secret manager." },
+	security: { label: "Security Patterns", category: "Security", weight: 5, description: "31 CWE patterns: XSS, injection, weak crypto, prototype pollution, path traversal.", risk: "These patterns represent OWASP Top 10 vulnerabilities.", recommendation: "Replace innerHTML with textContent. Never use eval(). Use parameterized queries." },
+	dependencies: { label: "Dependencies", category: "Security", weight: 5, description: "npm audit for CVEs, outdated package detection.", risk: "Vulnerable dependencies are the most common supply chain attack vector.", recommendation: "Run audit regularly. Use Dependabot or Renovate." },
+	architecture: { label: "Architecture", category: "Architecture", weight: 5, description: "Circular deps, god modules, orphans, fan-out, import graph analysis.", risk: "Circular deps make refactoring impossible. God modules become bottlenecks.", recommendation: "Break circular deps. Split god modules by concern." },
+	performance: { label: "Performance", category: "Architecture", weight: 4, description: "Barrel imports, heavy deps, dynamic import opportunities, CSS-in-JS overhead.", risk: "Barrel files prevent tree-shaking, bloating bundles 2-10x.", recommendation: "Replace barrel re-exports with direct imports." },
+	confusion: { label: "Confusion Index", category: "LLM Readiness", weight: 6, description: "Naming ambiguity that causes LLMs to misunderstand code.", risk: "LLMs drop 28.6% on code tasks when names are ambiguous.", recommendation: "Use descriptive, unique names. Avoid synonym files." },
+	context: { label: "Context Locality", category: "LLM Readiness", weight: 5, description: "Token density, import depth, circular dep impact on LLM navigation.", risk: "Files over 4000 tokens exceed the LLM attention sweet spot.", recommendation: "Keep files under 400 lines. Limit imports to <15 per file." },
+	"doc-coherence": { label: "Doc Coherence", category: "AI Analysis", weight: 0, description: "LLM-powered: stale README claims, incorrect JSDoc, outdated CHANGELOG.", risk: "Stale docs actively mislead developers and LLMs.", recommendation: "Pro feature — set VCQA_PRO_KEY." },
+	"code-coherence": { label: "Code Coherence", category: "AI Analysis", weight: 0, description: "LLM-powered: inconsistent validation, conflicting defaults, naming drift.", risk: "Incoherent codebases cause 'works on my machine' bugs.", recommendation: "Pro feature — set VCQA_PRO_KEY." },
+	"comment-staleness": { label: "Comment Staleness", category: "AI Analysis", weight: 0, description: "Stale TODOs, numeric mismatches, commented-out code, @deprecated without replacement.", risk: "Stale comments mislead developers and AI agents.", recommendation: "Delete old TODOs. Remove commented-out code." },
+	"dead-patterns": { label: "Dead Patterns", category: "AI Analysis", weight: 0, description: "Leftover code from incomplete refactors: fallbacks, parallel impls, dead guards.", risk: "Vibe-coded projects accumulate dead patterns fast.", recommendation: "Pro feature — set VCQA_PRO_KEY." },
+	"test-audit": { label: "Test Audit", category: "AI Analysis", weight: 0, description: "Fake/shallow tests: empty bodies, trivial assertions, mock abuse.", risk: "AI-generated tests often look real but test nothing.", recommendation: "Pro feature — set VCQA_PRO_KEY." },
+};
 
 // Cache scan results to avoid re-scanning on every tool call
 let cachedReport: ScanReport | null = null;
@@ -46,8 +84,7 @@ function runScan(cwd: string): ScanReport {
 	const reportPath = join(cwd, ".vibe-check", "report.json");
 	if (existsSync(reportPath)) {
 		try {
-			const stat = require("node:fs").statSync(reportPath);
-			// Use cached report if less than 5 minutes old
+			const stat = statSync(reportPath);
 			if (now - stat.mtimeMs < 300_000) {
 				const report = JSON.parse(readFileSync(reportPath, "utf-8")) as ScanReport;
 				cachedReport = report;
@@ -63,7 +100,7 @@ function runScan(cwd: string): ScanReport {
 		const stdout = execSync("npx @vibecodeqa/cli --skip-tests --json .", {
 			cwd,
 			encoding: "utf-8",
-			timeout: 30_000,
+			timeout: 60_000,
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		const report = JSON.parse(stdout) as ScanReport;
@@ -76,36 +113,9 @@ function runScan(cwd: string): ScanReport {
 	}
 }
 
-// Load check metadata from the CLI package
-function getCheckMeta(checkName: string): { label: string; description: string; risk: string; recommendation: string; weight: number; category: string } {
-	try {
-		const stdout = execSync(`npx @vibecodeqa/cli explain ${checkName} 2>/dev/null`, {
-			encoding: "utf-8",
-			timeout: 10_000,
-			stdio: ["pipe", "pipe", "pipe"],
-		});
-		// Parse the explain output
-		const label = stdout.match(/\x1b\[38;5;141m(.*?)\x1b/)?.[1] || checkName;
-		const what = stdout.match(/What:\x1b\[0m (.*)/)?.[1] || "";
-		const risk = stdout.match(/Risk:\x1b\[0m (.*)/)?.[1] || "";
-		const fix = stdout.match(/Fix:\x1b\[0m (.*)/)?.[1] || "";
-		const meta = stdout.match(/(\w+) priority · (\d+)% weight/);
-		return {
-			label,
-			description: what,
-			risk,
-			recommendation: fix,
-			weight: meta ? parseInt(meta[2], 10) : 5,
-			category: "",
-		};
-	} catch {
-		return { label: checkName, description: "", risk: "", recommendation: "", weight: 5, category: "" };
-	}
-}
-
 const server = new McpServer({
 	name: "vcqa",
-	version: "0.1.0",
+	version: "0.2.0",
 });
 
 // ── Tool: vcqa_score ──
@@ -123,7 +133,12 @@ server.tool(
 					score: report.score,
 					grade: report.grade,
 					summary: `${report.grade} ${report.score}/100`,
-					checks: report.checks.map(c => ({ name: c.name, score: c.score, grade: c.grade, issues: c.issues.length })),
+					checks: report.checks.map(c => ({
+						name: c.name,
+						score: c.score,
+						grade: c.grade,
+						issues: c.issues.length,
+					})),
 				}, null, 2),
 			}],
 		};
@@ -133,7 +148,7 @@ server.tool(
 // ── Tool: vcqa_scan ──
 server.tool(
 	"vcqa_scan",
-	"Run a full code health scan. Returns score, grade, and all 22 check results with issues. Use vcqa_score for a quicker summary.",
+	"Run a full code health scan. Returns score, grade, and all 25 check results with issues. Use vcqa_score for a quicker summary.",
 	{ path: z.string().optional().describe("Project directory path (defaults to cwd)") },
 	async ({ path }) => {
 		const cwd = path || process.cwd();
@@ -150,7 +165,7 @@ server.tool(
 // ── Tool: vcqa_file_health ──
 server.tool(
 	"vcqa_file_health",
-	"Get all code health issues for a specific file. Use this before modifying a file to understand existing problems, or after modifying to check if you introduced new issues.",
+	"Get all code health issues for a specific file. Use before modifying a file to understand existing problems, or after to check for new issues.",
 	{
 		file: z.string().describe("File path relative to project root (e.g., 'src/auth.ts')"),
 		path: z.string().optional().describe("Project directory path (defaults to cwd)"),
@@ -161,7 +176,7 @@ server.tool(
 		const fileIssues: { check: string; severity: string; message: string; line?: number; rule?: string }[] = [];
 		for (const c of report.checks) {
 			for (const i of c.issues) {
-				if (i.file && (i.file === file || i.file.includes(file))) {
+				if (i.file && (i.file === file || i.file.endsWith(`/${file}`) || file.endsWith(i.file))) {
 					fileIssues.push({ check: c.name, severity: i.severity, message: i.message, line: i.line, rule: i.rule });
 				}
 			}
@@ -185,7 +200,7 @@ server.tool(
 // ── Tool: vcqa_check ──
 server.tool(
 	"vcqa_check",
-	"Get detailed results for a specific check (e.g., 'complexity', 'security', 'testing'). Shows score, issues, and recommendations.",
+	"Get detailed results for a specific check (e.g., 'complexity', 'security', 'testing'). Shows score, issues, and metadata.",
 	{
 		check: z.string().describe("Check name (e.g., 'complexity', 'security', 'testing', 'architecture')"),
 		path: z.string().optional().describe("Project directory path (defaults to cwd)"),
@@ -202,15 +217,20 @@ server.tool(
 				}],
 			};
 		}
+		const meta = CHECK_META[check];
 		return {
 			content: [{
 				type: "text" as const,
 				text: JSON.stringify({
 					name: c.name,
+					label: meta?.label || c.name,
 					score: c.score,
 					grade: c.grade,
+					category: meta?.category,
+					weight: meta ? `${meta.weight}%` : undefined,
 					details: c.details,
 					issues: c.issues,
+					recommendation: meta?.recommendation,
 				}, null, 2),
 			}],
 		};
@@ -220,18 +240,27 @@ server.tool(
 // ── Tool: vcqa_explain ──
 server.tool(
 	"vcqa_explain",
-	"Explain what a specific check measures, why it matters, and how to fix issues. Use this to understand WHY a check is flagging something.",
+	"Explain what a specific check measures, why it matters, and how to fix issues. Use to understand WHY a check is flagging something.",
 	{
 		check: z.string().describe("Check name to explain (e.g., 'confusion', 'context', 'architecture')"),
 	},
 	async ({ check }) => {
-		const meta = getCheckMeta(check);
+		const meta = CHECK_META[check];
+		if (!meta) {
+			return {
+				content: [{
+					type: "text" as const,
+					text: JSON.stringify({ error: `Unknown check: ${check}`, available: Object.keys(CHECK_META) }, null, 2),
+				}],
+			};
+		}
 		return {
 			content: [{
 				type: "text" as const,
 				text: JSON.stringify({
 					name: check,
 					label: meta.label,
+					category: meta.category,
 					weight: `${meta.weight}%`,
 					what: meta.description,
 					risk: meta.risk,
@@ -239,6 +268,50 @@ server.tool(
 				}, null, 2),
 			}],
 		};
+	},
+);
+
+// ── Tool: vcqa_fix ──
+server.tool(
+	"vcqa_fix",
+	"AI-powered fix for code quality issues. Scans the project, identifies fixable issues, and uses Claude to generate and apply fixes. Requires ANTHROPIC_API_KEY env var.",
+	{
+		path: z.string().optional().describe("Project directory path (defaults to cwd)"),
+		check: z.string().optional().describe("Only fix issues from a specific check (e.g., 'security')"),
+		dryRun: z.boolean().optional().describe("Preview fixes without applying (default: false)"),
+	},
+	async ({ path, check, dryRun }) => {
+		const cwd = path || process.cwd();
+		const flags = ["fix", "--ai"];
+		if (check) flags.push("--check", check);
+		if (dryRun) flags.push("--dry-run");
+		flags.push(cwd);
+
+		try {
+			const stdout = execSync(`npx @vibecodeqa/cli ${flags.join(" ")}`, {
+				cwd,
+				encoding: "utf-8",
+				timeout: 120_000,
+				stdio: ["pipe", "pipe", "pipe"],
+				env: { ...process.env },
+			});
+			// Invalidate cache after fix
+			cachedReport = null;
+			return {
+				content: [{
+					type: "text" as const,
+					text: stdout.replace(/\x1b\[[0-9;]*m/g, ""), // strip ANSI
+				}],
+			};
+		} catch (err: any) {
+			const output = err.stdout || err.stderr || String(err);
+			return {
+				content: [{
+					type: "text" as const,
+					text: output.replace(/\x1b\[[0-9;]*m/g, ""),
+				}],
+			};
+		}
 	},
 );
 
