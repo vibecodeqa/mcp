@@ -315,6 +315,94 @@ server.tool(
 	},
 );
 
+// ── Tool: vcqa_delta ──
+server.tool(
+	"vcqa_delta",
+	"Compare current scan against previous scan. Shows what changed: score delta, fixed issues, new issues, per-check changes. Useful after making fixes to see impact.",
+	{
+		path: z.string().optional().describe("Project directory path (defaults to cwd)"),
+	},
+	async ({ path }) => {
+		const cwd = path || process.cwd();
+		const reportPath = join(cwd, ".vibe-check", "report.json");
+
+		// Load previous report
+		let prevReport: ScanReport | null = null;
+		if (existsSync(reportPath)) {
+			try { prevReport = JSON.parse(readFileSync(reportPath, "utf-8")) as ScanReport; } catch { /* corrupt */ }
+		}
+
+		if (!prevReport) {
+			return { content: [{ type: "text" as const, text: "No previous report found. Run vcqa_scan first to establish a baseline, then make changes and run vcqa_delta." }] };
+		}
+
+		// Run fresh scan (invalidate cache to get live results)
+		cachedReport = null;
+		const currentReport = runScan(cwd);
+
+		// Compute delta (issue-level diffing)
+		const beforeIssues = new Map<string, number>();
+		const afterIssues = new Map<string, number>();
+
+		for (const c of prevReport.checks) {
+			for (const iss of c.issues) {
+				const key = `${c.name}|${iss.rule || ""}|${iss.file || ""}|${iss.message}`;
+				beforeIssues.set(key, (beforeIssues.get(key) || 0) + 1);
+			}
+		}
+		for (const c of currentReport.checks) {
+			for (const iss of c.issues) {
+				const key = `${c.name}|${iss.rule || ""}|${iss.file || ""}|${iss.message}`;
+				afterIssues.set(key, (afterIssues.get(key) || 0) + 1);
+			}
+		}
+
+		let fixedCount = 0;
+		let newCount = 0;
+		const fixedSamples: string[] = [];
+		const newSamples: string[] = [];
+
+		for (const [key, bCount] of beforeIssues) {
+			const aCount = afterIssues.get(key) || 0;
+			if (bCount > aCount) {
+				fixedCount += bCount - aCount;
+				if (fixedSamples.length < 5) fixedSamples.push(key.split("|").slice(0, 2).join(": "));
+			}
+		}
+		for (const [key, aCount] of afterIssues) {
+			const bCount = beforeIssues.get(key) || 0;
+			if (aCount > bCount) {
+				newCount += aCount - bCount;
+				if (newSamples.length < 5) newSamples.push(key.split("|").slice(0, 2).join(": "));
+			}
+		}
+
+		const scoreDelta = currentReport.score - prevReport.score;
+		const checkChanges = currentReport.checks
+			.map((c: ScanReport["checks"][0]) => {
+				const prev = prevReport!.checks.find((p: ScanReport["checks"][0]) => p.name === c.name);
+				return { name: c.name, before: prev?.score ?? 0, after: c.score, delta: c.score - (prev?.score ?? 0) };
+			})
+			.filter((c: { delta: number }) => c.delta !== 0)
+			.sort((a: { delta: number }, b: { delta: number }) => b.delta - a.delta);
+
+		let text = `Score: ${prevReport.grade} ${prevReport.score} → ${currentReport.grade} ${currentReport.score} (${scoreDelta > 0 ? "+" : ""}${scoreDelta})\n`;
+		text += `Fixed: ${fixedCount} issues | New: ${newCount} issues\n\n`;
+
+		if (checkChanges.length > 0) {
+			text += "Check changes:\n";
+			for (const c of checkChanges.slice(0, 10)) {
+				text += `  ${c.delta > 0 ? "+" : ""}${c.delta} ${c.name} (${c.before} → ${c.after})\n`;
+			}
+			text += "\n";
+		}
+		if (fixedSamples.length > 0) text += `Fixed examples: ${fixedSamples.join(", ")}\n`;
+		if (newSamples.length > 0) text += `New examples: ${newSamples.join(", ")}\n`;
+
+		return { content: [{ type: "text" as const, text }] };
+	},
+);
+
 // ── Start server ──
 async function main() {
 	const transport = new StdioServerTransport();
