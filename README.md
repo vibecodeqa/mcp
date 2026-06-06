@@ -42,6 +42,7 @@ npx @vibecodeqa/mcp
 | `vcqa_file_health` | Issues for a specific file (use before/after editing) |
 | `vcqa_check` | Detailed results for one check (e.g., "complexity") |
 | `vcqa_explain` | What a check measures, why it matters, how to fix |
+| `vcqa_fix` | AI-powered fix for code issues (needs ANTHROPIC_API_KEY) |
 
 ## How agents use it
 
