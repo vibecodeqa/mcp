@@ -43,6 +43,7 @@ npx @vibecodeqa/mcp
 | `vcqa_check` | Detailed results for one check (e.g., "complexity") |
 | `vcqa_explain` | What a check measures, why it matters, how to fix |
 | `vcqa_fix` | AI-powered fix for code issues (needs ANTHROPIC_API_KEY) |
+| `vcqa_delta` | Compare current scan vs previous — shows fixed/new issues |
 
 ## How agents use it
 
@@ -61,6 +62,14 @@ The agent now knows to simplify the function, add error handling, and write a te
 ← 1 new issue: innerHTML assignment in src/dashboard.tsx:42
 ```
 The agent fixes the security issue before committing.
+
+**After a fix session:**
+```
+→ vcqa_delta()
+← Score: C 64 → B 80 (+16)
+  Fixed: 89 issues | New: 3 issues
+  +73 confusion (0 → 73), +55 lint (45 → 100), +12 standards (36 → 48)
+```
 
 **Understanding a check:**
 ```
