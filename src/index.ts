@@ -5,7 +5,7 @@
  * Gives AI coding agents real-time code health context.
  * Tools:
  *   vcqa_score       — Quick score + grade (fastest, uses cache)
- *   vcqa_scan        — Full scan with all 25 check results
+ *   vcqa_scan        — Full scan with all 34 check results
  *   vcqa_file_health — Get issues for a specific file
  *   vcqa_check       — Get details for a specific check
  *   vcqa_explain     — Explain what a check measures and how to fix it
@@ -148,7 +148,7 @@ server.tool(
 // ── Tool: vcqa_scan ──
 server.tool(
 	"vcqa_scan",
-	"Run a full code health scan. Returns score, grade, and all 25 check results with issues. Use vcqa_score for a quicker summary.",
+	"Run a full code health scan. Returns score, grade, and all 34 check results with issues. Use vcqa_score for a quicker summary.",
 	{ path: z.string().optional().describe("Project directory path (defaults to cwd)") },
 	async ({ path }) => {
 		const cwd = path || process.cwd();
