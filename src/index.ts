@@ -16,6 +16,9 @@
  *   vcqa_read_file   — Read a source file (numbered) — the exact code on screen
  *   vcqa_list_files  — List project files (the Files-view inventory)
  *   vcqa_grep        — Regex-search the project's source
+ *   vcqa_graph       — Module dependency graph (the Graph view's nodes/edges)
+ *   vcqa_app_state   — The running monitor's live folder + open page
+ *   vcqa_copilot_thread — The in-app copilot's conversation for a page
  *
  * Usage:
  *   npx @vibecodeqa/mcp                  # stdio transport (for Claude Code, Cursor, etc.)
@@ -25,7 +28,8 @@
 
 import { execSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { extname, join, relative, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, extname, join, relative, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -121,7 +125,7 @@ function runScan(cwd: string): ScanReport {
 
 const server = new McpServer({
 	name: "vcqa",
-	version: "0.3.0",
+	version: "0.4.0",
 });
 
 // ── Tool: vcqa_score ──
@@ -525,6 +529,186 @@ server.tool(
 			}
 		}
 		return { content: [{ type: "text" as const, text: hits.length ? hits.join("\n") : "no matches" }] };
+	},
+);
+
+// ── Tool: vcqa_graph (dependency graph — the Graph view's nodes/edges) ──
+
+const CODE_EXTS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
+const IMPORT_RE =
+	/(?:import|export)[^'"`]*?from\s*['"]([^'"]+)['"]|(?:^|[^.\w])import\s*['"]([^'"]+)['"]|require\(\s*['"]([^'"]+)['"]\s*\)|import\(\s*['"]([^'"]+)['"]\s*\)/g;
+
+/** Resolve a relative import spec to an on-disk file (trying extensions + /index). */
+function resolveLocal(fromFile: string, spec: string): string | null {
+	const baseAbs = resolve(dirname(fromFile), spec);
+	const tries = [baseAbs, ...CODE_EXTS.map((e) => baseAbs + e), ...CODE_EXTS.map((e) => join(baseAbs, "index" + e))];
+	for (const t of tries) { try { if (statSync(t).isFile()) return t; } catch { /* next */ } }
+	return null;
+}
+
+function libName(spec: string): string {
+	if (spec.startsWith("@")) return spec.split("/").slice(0, 2).join("/");
+	return spec.split("/")[0];
+}
+
+function buildImportGraph(root: string) {
+	const files = walkFiles(root, { exts: new Set(CODE_EXTS) });
+	const nodes = new Map<string, { id: string; label: string; type: string; indeg: number; outdeg: number }>();
+	const edges: { from: string; to: string }[] = [];
+	const nodeFor = (id: string, label: string, type: string) => {
+		if (!nodes.has(id)) nodes.set(id, { id, label, type, indeg: 0, outdeg: 0 });
+		return nodes.get(id) as { id: string; label: string; type: string; indeg: number; outdeg: number };
+	};
+	for (const abs of files) {
+		const rel = relative(root, abs);
+		const type = /\.(tsx|jsx)$/.test(abs) ? "ui" : "module";
+		const src = nodeFor(rel, rel.split("/").pop() || rel, type);
+		let content: string;
+		try { if (statSync(abs).size > 2_000_000) continue; content = readFileSync(abs, "utf-8"); } catch { continue; }
+		const seen = new Set<string>();
+		for (const m of content.matchAll(IMPORT_RE)) {
+			const spec = m[1] || m[2] || m[3] || m[4];
+			if (!spec || seen.has(spec)) continue;
+			seen.add(spec);
+			let toId: string;
+			if (spec.startsWith(".") || spec.startsWith("/")) {
+				const target = resolveLocal(abs, spec);
+				if (!target) continue;
+				const trel = relative(root, target);
+				nodeFor(trel, trel.split("/").pop() || trel, /\.(tsx|jsx)$/.test(target) ? "ui" : "module");
+				toId = trel;
+			} else {
+				const name = libName(spec);
+				nodeFor(`lib:${name}`, name, "lib");
+				toId = `lib:${name}`;
+			}
+			edges.push({ from: rel, to: toId });
+			src.outdeg++;
+			(nodes.get(toId) as { indeg: number }).indeg++;
+		}
+	}
+	const list = [...nodes.values()];
+	return { nodes: list, edges };
+}
+
+server.tool(
+	"vcqa_graph",
+	"Get the project's module dependency graph — the nodes and edges the monitor's Graph view draws. Nodes are files (type module|ui) and external libs (type lib); edges are imports. Use to see who imports/depends on a file.",
+	{ path: z.string().optional().describe("Project directory (defaults to cwd)") },
+	async ({ path }) => {
+		const cwd = resolve(path || process.cwd());
+		const g = buildImportGraph(cwd);
+		const byType: Record<string, number> = {};
+		for (const n of g.nodes) byType[n.type] = (byType[n.type] || 0) + 1;
+		const mostConnected = [...g.nodes]
+			.filter((n) => n.type !== "lib")
+			.sort((a, b) => b.indeg + b.outdeg - (a.indeg + a.outdeg))
+			.slice(0, 10)
+			.map((n) => ({ id: n.id, in: n.indeg, out: n.outdeg }));
+		return {
+			content: [{
+				type: "text" as const,
+				text: JSON.stringify({ summary: { nodes: g.nodes.length, edges: g.edges.length, byType }, mostConnected, nodes: g.nodes, edges: g.edges }, null, 2),
+			}],
+		};
+	},
+);
+
+// ── Live app state: read the running monitor's localStorage (macOS/dev) ──
+// The desktop app persists its UI state and each page's copilot thread in the
+// WKWebView localStorage. Exposing it here gives an external agent the SAME view
+// the user is looking at — current folder/page and the copilot conversation —
+// entirely through MCP (no reaching around into the app's private store).
+
+let cachedStore: string | null = null;
+/** Find the monitor's localStorage sqlite (the one holding vcqa keys). */
+function findMonitorStore(): string | null {
+	if (cachedStore && existsSync(cachedStore)) return cachedStore;
+	try {
+		const base = join(homedir(), "Library", "WebKit");
+		if (!existsSync(base)) return null;
+		const found = execSync(`find "${base}" -name localstorage.sqlite3 -type f 2>/dev/null`, { encoding: "utf-8" }).trim();
+		for (const db of found.split("\n").filter(Boolean)) {
+			try {
+				const keys = execSync(`sqlite3 "${db}" "SELECT key FROM ItemTable LIMIT 300;" 2>/dev/null`, { encoding: "utf-8" });
+				if (keys.includes("vcqa:monitor") || keys.includes("vibe-monitor.copilot")) { cachedStore = db; return db; }
+			} catch { /* locked / unreadable — try next */ }
+		}
+	} catch { /* find / sqlite3 unavailable */ }
+	return null;
+}
+
+/** Read one localStorage value (WebKit stores them as UTF-16LE blobs). Copies the
+ *  db first so a live write in the running app can't lock or tear the read. */
+function readStoreValue(db: string, key: string): string | null {
+	const tmp = join(tmpdir(), `vcqa-ls-${process.pid}.sqlite3`);
+	try {
+		execSync(`cp "${db}" "${tmp}" 2>/dev/null; for x in wal shm; do [ -f "${db}-$x" ] && cp "${db}-$x" "${tmp}-$x" 2>/dev/null; done; true`);
+		const hex = execSync(`sqlite3 "${tmp}" "SELECT hex(value) FROM ItemTable WHERE key='${key.replace(/'/g, "''")}';" 2>/dev/null`, { encoding: "utf-8" }).trim();
+		if (!hex) return null;
+		const buf = Buffer.from(hex, "hex");
+		let s = buf.toString("utf16le");
+		if (s.includes("�")) { const u8 = buf.toString("utf8"); if (!u8.includes("�")) s = u8; }
+		return s;
+	} catch { return null; } finally {
+		try { execSync(`rm -f "${tmp}" "${tmp}-wal" "${tmp}-shm"`); } catch { /* ignore */ }
+	}
+}
+
+const VIEW_LABELS: Record<string, string> = {
+	overview: "Health", files: "Files", canopy: "Graph", complexity: "Complexity",
+	clones: "Clones", types: "Types", schema: "Schema", lint: "Lint",
+	security: "Security", deps: "Deps", tests: "Tests", trends: "Trends",
+	activity: "Activity", settings: "Settings",
+};
+
+// ── Tool: vcqa_app_state ──
+server.tool(
+	"vcqa_app_state",
+	"Read the running VibeCode Monitor's live UI state — which project folder and which page (view) the user is currently looking at, and whether the copilot panel is open. This is what's on the user's screen right now.",
+	{},
+	async () => {
+		const db = findMonitorStore();
+		if (!db) return { content: [{ type: "text" as const, text: "Monitor localStorage not found (app not running, or unsupported platform)." }], isError: true };
+		const raw = (k: string) => readStoreValue(db, k);
+		const unq = (v: string | null) => (v ? v.replace(/^"|"$/g, "") : null);
+		const view = unq(raw("vcqa:monitor:view"));
+		return {
+			content: [{
+				type: "text" as const,
+				text: JSON.stringify({
+					folder: unq(raw("vcqa:monitor:folder")),
+					view,
+					page: view ? VIEW_LABELS[view] ?? view : null,
+					copilotOpen: raw("vcqa:monitor:copilot-open") === "true" || raw("vcqa:monitor:copilot-open") === "1",
+				}, null, 2),
+			}],
+		};
+	},
+);
+
+// ── Tool: vcqa_copilot_thread ──
+server.tool(
+	"vcqa_copilot_thread",
+	"Read the in-app copilot's conversation for a page — the exact messages the user and the desktop copilot exchanged, including which tools it ran. Use to see what the copilot said/saw. Omit `page` to get every page's thread.",
+	{ page: z.string().optional().describe("Page id, e.g. 'canopy' (Graph), 'schema', 'complexity'. Omit for all pages.") },
+	async ({ page }) => {
+		const db = findMonitorStore();
+		if (!db) return { content: [{ type: "text" as const, text: "Monitor localStorage not found (app not running, or unsupported platform)." }], isError: true };
+		const rawVal = readStoreValue(db, "vibe-monitor.copilot.threads.v1");
+		if (!rawVal) return { content: [{ type: "text" as const, text: "No copilot threads yet." }] };
+		let all: Record<string, { role: string; text?: string; toolCalls?: { name?: string }[] }[]>;
+		try { all = JSON.parse(rawVal); } catch { return { content: [{ type: "text" as const, text: "Could not parse copilot threads." }], isError: true }; }
+		const pick = page ? { [page]: all[page] ?? [] } : all;
+		const out: Record<string, unknown[]> = {};
+		for (const [pg, msgs] of Object.entries(pick)) {
+			out[pg] = (msgs || []).map((m) => ({
+				role: m.role,
+				...(m.text ? { text: m.text } : {}),
+				...(m.toolCalls?.length ? { tools: m.toolCalls.map((t) => t.name) } : {}),
+			}));
+		}
+		return { content: [{ type: "text" as const, text: JSON.stringify(out, null, 2) }] };
 	},
 );
 
