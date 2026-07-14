@@ -35,7 +35,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync,
 import { homedir, tmpdir } from "node:os";
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { buildArchitecture, type GraphifyGraph } from "./architecture.js";
-import { buildCallGraph, entryPoints, resolveRoot, traceFrom } from "./callflow.js";
+import { buildCallGraph, entryPoints, resolveRootMatches, traceFrom } from "./callflow.js";
 import { buildSequence, toMermaid } from "./sequence.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -738,18 +738,25 @@ server.tool(
 			const eps = entryPoints(cg).slice(0, 40).map((e) => ({ name: e.name, kind: e.kind, layer: e.layer, reach: e.reach, file: e.file }));
 			return { content: [{ type: "text" as const, text: JSON.stringify({ entryPoints: eps, note: "Pass root=<name> to trace a symbol's downstream call tree." }, null, 2) }] };
 		}
-		const rootId = resolveRoot(cg, root);
-		if (!rootId) {
+		const matches = resolveRootMatches(cg, root);
+		if (matches.length === 0) {
 			const suggest = entryPoints(cg).slice(0, 8).map((e) => e.name);
 			return { content: [{ type: "text" as const, text: JSON.stringify({ error: `No callable symbol named "${root}". Try one of: ${suggest.join(", ")}` }) }], isError: true };
 		}
+		const rootId = matches[0];
 		const trace = traceFrom(cg, rootId, { maxDepth: max_depth ?? 6 });
 		const byId = new Map(trace.nodes.map((n) => [n.id, n.name]));
+		// If a plain name matched several symbols, say so and surface the alternatives
+		// (by file) so the caller can re-query with the exact one they meant.
+		const ambiguous = matches.length > 1
+			? matches.map((id) => ({ id, name: cg.nodes.get(id)!.name, file: cg.nodes.get(id)!.file }))
+			: undefined;
 		return {
 			content: [{
 				type: "text" as const,
 				text: JSON.stringify({
 					root: cg.nodes.get(rootId)!.name,
+					...(ambiguous ? { ambiguous } : {}),
 					truncated: trace.truncated,
 					symbols: trace.nodes.map((n) => ({ name: n.name, kind: n.kind, layer: n.layer, depth: n.depth, file: n.file })),
 					calls: trace.edges.map((e) => ({ from: byId.get(e.from), to: byId.get(e.to) })),
@@ -778,11 +785,15 @@ server.tool(
 		if (error) return { content: [{ type: "text" as const, text: JSON.stringify({ error }) }], isError: true };
 
 		const cg = buildCallGraph(graph);
-		const rootId = resolveRoot(cg, root);
-		if (!rootId) {
+		const matches = resolveRootMatches(cg, root);
+		if (matches.length === 0) {
 			const suggest = entryPoints(cg).slice(0, 8).map((e) => e.name);
 			return { content: [{ type: "text" as const, text: JSON.stringify({ error: `No callable symbol named "${root}". Try one of: ${suggest.join(", ")}` }) }], isError: true };
 		}
+		const rootId = matches[0];
+		const ambiguous = matches.length > 1
+			? matches.map((id) => ({ id, name: cg.nodes.get(id)!.name, file: cg.nodes.get(id)!.file }))
+			: undefined;
 		const seq = buildSequence(cg, rootId, { maxDepth: max_depth ?? 6 });
 		const nameOf = new Map(seq.participants.map((p) => [p.id, p.name]));
 		return {
@@ -790,6 +801,7 @@ server.tool(
 				type: "text" as const,
 				text: JSON.stringify({
 					root: seq.root,
+					...(ambiguous ? { ambiguous } : {}),
 					truncated: seq.truncated,
 					participants: seq.participants.map((p) => ({ name: p.name, kind: p.kind, layer: p.layer })),
 					steps: seq.steps.map((s) => ({ from: nameOf.get(s.from), to: nameOf.get(s.to), depth: s.depth })),

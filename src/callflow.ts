@@ -102,10 +102,17 @@ export function traceFrom(cg: CallGraph, root: string, opts: { maxNodes?: number
 	return { root, nodes, edges, truncated };
 }
 
-/** Resolve a user-supplied root (symbol name or id) to a node id. */
-export function resolveRoot(cg: CallGraph, root: string): string | null {
-	if (cg.nodes.has(root)) return root;
+/** All node ids matching a user-supplied root (exact id, else case-insensitive
+ *  name). More than one means the name is ambiguous across files. */
+export function resolveRootMatches(cg: CallGraph, root: string): string[] {
+	if (cg.nodes.has(root)) return [root];
 	const lc = root.replace(/\(\)$/, "").toLowerCase();
-	for (const [id, n] of cg.nodes) if (n.name.toLowerCase() === lc) return id;
-	return null;
+	const ids: string[] = [];
+	for (const [id, n] of cg.nodes) if (n.name.toLowerCase() === lc) ids.push(id);
+	return ids;
+}
+
+/** Resolve a user-supplied root (symbol name or id) to a single node id. */
+export function resolveRoot(cg: CallGraph, root: string): string | null {
+	return resolveRootMatches(cg, root)[0] ?? null;
 }
