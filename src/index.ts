@@ -2,7 +2,9 @@
 /**
  * VibeCode QA MCP Server
  *
- * Gives AI coding agents real-time code health context.
+ * Gives AI coding agents real-time code health context — the same data the
+ * VibeCode monitor shows — so a desktop copilot and an external agent (Claude
+ * Code, Cursor, …) share one toolbelt over the same project.
  * Tools:
  *   vcqa_score       — Quick score + grade (fastest, uses cache)
  *   vcqa_scan        — Full scan with all 34 check results
@@ -10,6 +12,10 @@
  *   vcqa_check       — Get details for a specific check
  *   vcqa_explain     — Explain what a check measures and how to fix it
  *   vcqa_fix         — AI-powered fix for code issues (needs ANTHROPIC_API_KEY)
+ *   vcqa_delta       — Score/issue delta vs the previous scan
+ *   vcqa_read_file   — Read a source file (numbered) — the exact code on screen
+ *   vcqa_list_files  — List project files (the Files-view inventory)
+ *   vcqa_grep        — Regex-search the project's source
  *
  * Usage:
  *   npx @vibecodeqa/mcp                  # stdio transport (for Claude Code, Cursor, etc.)
@@ -18,8 +24,8 @@
  */
 
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { extname, join, relative, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -115,7 +121,7 @@ function runScan(cwd: string): ScanReport {
 
 const server = new McpServer({
 	name: "vcqa",
-	version: "0.2.0",
+	version: "0.3.0",
 });
 
 // ── Tool: vcqa_score ──
@@ -400,6 +406,125 @@ server.tool(
 		if (newSamples.length > 0) text += `New examples: ${newSamples.join(", ")}\n`;
 
 		return { content: [{ type: "text" as const, text }] };
+	},
+);
+
+// ── Code-access tools (let an agent read the SAME source the monitor shows) ──
+
+const IGNORE_DIRS = new Set([
+	"node_modules", ".git", "dist", "build", ".next", "out", "coverage",
+	".vibe-check", ".turbo", ".wrangler", ".cache", "target", ".svelte-kit", "vendor",
+]);
+const SOURCE_EXTS = new Set([
+	".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte",
+	".py", ".go", ".rs", ".java", ".rb", ".php", ".cs", ".css", ".scss",
+	".json", ".md", ".yml", ".yaml", ".prisma", ".sql",
+]);
+
+/** Walk a project's files, skipping the usual build/vendor dirs. */
+function walkFiles(root: string, opts: { exts?: Set<string>; max?: number } = {}): string[] {
+	const out: string[] = [];
+	const max = opts.max ?? 10_000;
+	const stack: string[] = [root];
+	while (stack.length && out.length < max) {
+		const dir = stack.pop() as string;
+		let entries: import("node:fs").Dirent[];
+		try { entries = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+		for (const e of entries) {
+			const full = join(dir, e.name);
+			if (e.isDirectory()) {
+				if (!IGNORE_DIRS.has(e.name)) stack.push(full);
+			} else if (e.isFile()) {
+				if (!opts.exts || opts.exts.has(extname(e.name))) out.push(full);
+			}
+		}
+	}
+	return out;
+}
+
+/** Resolve `rel` under `root`, refusing paths that escape the project. */
+function safeResolve(root: string, rel: string): string {
+	const base = resolve(root);
+	const abs = resolve(base, rel);
+	if (abs !== base && !abs.startsWith(base + "/")) {
+		throw new Error(`path escapes project root: ${rel}`);
+	}
+	return abs;
+}
+
+// ── Tool: vcqa_read_file ──
+server.tool(
+	"vcqa_read_file",
+	"Read a source file from the project — the exact code the VibeCode monitor shows. Returns contents with line numbers so you can cite precise lines.",
+	{
+		file: z.string().describe("File path relative to project root, e.g. 'src/app.ts'"),
+		path: z.string().optional().describe("Project directory (defaults to cwd)"),
+		max_lines: z.number().optional().describe("Cap lines returned (default 800)"),
+	},
+	async ({ file, path, max_lines }) => {
+		const cwd = path || process.cwd();
+		let abs: string;
+		try { abs = safeResolve(cwd, file); } catch (e) { return { content: [{ type: "text" as const, text: String(e) }], isError: true }; }
+		if (!existsSync(abs)) return { content: [{ type: "text" as const, text: `Not found: ${file}` }], isError: true };
+		const lines = readFileSync(abs, "utf-8").split("\n");
+		const cap = max_lines ?? 800;
+		const numbered = lines.slice(0, cap).map((l, i) => `${String(i + 1).padStart(4)}  ${l}`).join("\n");
+		const more = lines.length > cap ? `\n… (${lines.length - cap} more lines truncated)` : "";
+		return { content: [{ type: "text" as const, text: numbered + more }] };
+	},
+);
+
+// ── Tool: vcqa_list_files ──
+server.tool(
+	"vcqa_list_files",
+	"List the project's files (skipping node_modules/dist/.git etc.) — the inventory behind the monitor's Files view. Optionally filter by extension or a path substring.",
+	{
+		path: z.string().optional().describe("Project directory (defaults to cwd)"),
+		ext: z.string().optional().describe("Filter to an extension, e.g. 'ts' or '.tsx'"),
+		contains: z.string().optional().describe("Only paths containing this substring"),
+		limit: z.number().optional().describe("Max files to return (default 500)"),
+	},
+	async ({ path, ext, contains, limit }) => {
+		const cwd = resolve(path || process.cwd());
+		const exts = ext ? new Set([ext.startsWith(".") ? ext : `.${ext}`]) : undefined;
+		let files = walkFiles(cwd, { exts }).map((f) => relative(cwd, f));
+		if (contains) files = files.filter((f) => f.includes(contains));
+		const total = files.length;
+		files = files.sort().slice(0, limit ?? 500);
+		return { content: [{ type: "text" as const, text: JSON.stringify({ root: cwd, total, shown: files.length, files }, null, 2) }] };
+	},
+);
+
+// ── Tool: vcqa_grep ──
+server.tool(
+	"vcqa_grep",
+	"Search the project's source files for a regular expression. Returns matching 'file:line: text' — use to find where something is defined or used.",
+	{
+		pattern: z.string().describe("Regular expression to search for"),
+		path: z.string().optional().describe("Project directory (defaults to cwd)"),
+		ext: z.string().optional().describe("Restrict to an extension, e.g. 'ts'"),
+		max_matches: z.number().optional().describe("Cap total matches (default 200)"),
+	},
+	async ({ pattern, path, ext, max_matches }) => {
+		const cwd = resolve(path || process.cwd());
+		let re: RegExp;
+		try { re = new RegExp(pattern); } catch (e) { return { content: [{ type: "text" as const, text: `bad regex: ${String(e)}` }], isError: true }; }
+		const exts = ext ? new Set([ext.startsWith(".") ? ext : `.${ext}`]) : SOURCE_EXTS;
+		const cap = max_matches ?? 200;
+		const hits: string[] = [];
+		for (const f of walkFiles(cwd, { exts })) {
+			if (hits.length >= cap) break;
+			let content: string;
+			try { if (statSync(f).size > 2_000_000) continue; content = readFileSync(f, "utf-8"); } catch { continue; }
+			const lines = content.split("\n");
+			for (let i = 0; i < lines.length; i++) {
+				if (re.test(lines[i])) {
+					hits.push(`${relative(cwd, f)}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
+					if (hits.length >= cap) break;
+				}
+			}
+		}
+		return { content: [{ type: "text" as const, text: hits.length ? hits.join("\n") : "no matches" }] };
 	},
 );
 
