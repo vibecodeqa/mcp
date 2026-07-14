@@ -19,6 +19,7 @@
  *   vcqa_graph       — Module dependency graph (the Graph view's nodes/edges)
  *   vcqa_app_state   — The running monitor's live folder + open page
  *   vcqa_copilot_thread — The in-app copilot's conversation for a page
+ *   vcqa_copilot_send   — Text a page's copilot on the user's behalf; get its reply
  *
  * Usage:
  *   npx @vibecodeqa/mcp                  # stdio transport (for Claude Code, Cursor, etc.)
@@ -27,7 +28,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -125,7 +126,7 @@ function runScan(cwd: string): ScanReport {
 
 const server = new McpServer({
 	name: "vcqa",
-	version: "0.4.0",
+	version: "0.5.0",
 });
 
 // ── Tool: vcqa_score ──
@@ -709,6 +710,40 @@ server.tool(
 			}));
 		}
 		return { content: [{ type: "text" as const, text: JSON.stringify(out, null, 2) }] };
+	},
+);
+
+// ── Tool: vcqa_copilot_send (text a page's copilot on the user's behalf) ──
+server.tool(
+	"vcqa_copilot_send",
+	"Send a message to the running monitor's in-app copilot on a given page — as if the user typed it — and return the copilot's reply. The exchange also appears in the app UI. Requires the desktop monitor to be running. Write actions (issues/notes) never fire on a sent message.",
+	{
+		text: z.string().describe("The message to send to the copilot"),
+		page: z.string().optional().describe("Page id: 'canopy' (Graph), 'schema', 'complexity', 'overview' (default), …"),
+		timeout_s: z.number().optional().describe("How long to wait for the reply (default 90s)"),
+	},
+	async ({ text, page, timeout_s }) => {
+		const dir = join(homedir(), ".vibe-monitor", "copilot-bridge");
+		const reqDir = join(dir, "req");
+		const resDir = join(dir, "res");
+		mkdirSync(reqDir, { recursive: true });
+		mkdirSync(resDir, { recursive: true });
+		const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+		const reqPath = join(reqDir, `${id}.json`);
+		const resPath = join(resDir, `${id}.json`);
+		writeFileSync(reqPath, JSON.stringify({ id, page: page || "overview", text }));
+		const deadline = Date.now() + (timeout_s ?? 90) * 1000;
+		while (Date.now() < deadline) {
+			if (existsSync(resPath)) {
+				let reply = "";
+				try { reply = JSON.parse(readFileSync(resPath, "utf-8")).text ?? ""; } catch { /* keep empty */ }
+				try { unlinkSync(resPath); } catch { /* ignore */ }
+				return { content: [{ type: "text" as const, text: reply || "(empty reply)" }] };
+			}
+			await new Promise((r) => setTimeout(r, 500));
+		}
+		try { unlinkSync(reqPath); } catch { /* ignore */ }
+		return { content: [{ type: "text" as const, text: "Timed out waiting for the copilot — is the VibeCode Monitor running? (It polls every ~1.5s.)" }], isError: true };
 	},
 );
 
