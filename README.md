@@ -69,7 +69,8 @@ app's private storage.
 | Tool | Description |
 |------|-------------|
 | `vcqa_app_state` | The running monitor's current project folder + open page + copilot-open |
-| `vcqa_copilot_thread` | The in-app copilot's per-page conversation (messages + tools it ran) |
+| `vcqa_copilot_thread` | Read the in-app copilot's per-page conversation (messages + tools it ran) |
+| `vcqa_copilot_send` | Post a message to a page's in-app copilot (as the user) and return its reply — also shows in the app UI. Write actions never fire on a sent message. |
 
 Every project tool takes an optional `path` (defaults to cwd).
 
