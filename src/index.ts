@@ -17,6 +17,9 @@
  *   vcqa_list_files  — List project files (the Files-view inventory)
  *   vcqa_grep        — Regex-search the project's source
  *   vcqa_graph       — Module dependency graph (the Graph view's nodes/edges)
+ *   vcqa_architecture — React layers + inter-layer call flow (the Architecture view; needs graphify)
+ *   vcqa_callflow    — Real function-call tree from an entry symbol (the Flow view; needs graphify)
+ *   vcqa_sequence    — Static sequence diagram (Mermaid) for a symbol's call order (needs graphify)
  *   vcqa_app_state   — The running monitor's live folder + open page
  *   vcqa_copilot_thread — The in-app copilot's conversation for a page
  *   vcqa_copilot_send   — Text a page's copilot on the user's behalf; get its reply
@@ -27,10 +30,13 @@
  *   { "mcpServers": { "vcqa": { "command": "npx", "args": ["@vibecodeqa/mcp"] } } }
  */
 
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, extname, join, relative, resolve } from "node:path";
+import { buildArchitecture, type GraphifyGraph } from "./architecture.js";
+import { buildCallGraph, entryPoints, resolveRoot, traceFrom } from "./callflow.js";
+import { buildSequence, toMermaid } from "./sequence.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -552,7 +558,18 @@ function libName(spec: string): string {
 	return spec.split("/")[0];
 }
 
-function buildImportGraph(root: string) {
+/** Test/spec file by the conventions shared with the monitor's structural views:
+ *  a `.test.`/`.spec.` (or `_test.`) filename, or a path segment like `__tests__`,
+ *  `__mocks__`, `tests`, `test`, `e2e`. Tests are a separate class and are excluded
+ *  from the graph by default — they live in the Tests view, not the structure. */
+function isTestFile(rel: string): boolean {
+	const p = rel.replace(/\\/g, "/").toLowerCase();
+	const base = p.split("/").pop() || p;
+	if (/\.(test|spec)\.[cm]?[jt]sx?$/.test(base) || /_test\.[a-z0-9]+$/.test(base)) return true;
+	return p.split("/").some((seg) => seg === "__tests__" || seg === "__mocks__" || seg === "tests" || seg === "test" || seg === "e2e");
+}
+
+function buildImportGraph(root: string, includeTests = false) {
 	const files = walkFiles(root, { exts: new Set(CODE_EXTS) });
 	const nodes = new Map<string, { id: string; label: string; type: string; indeg: number; outdeg: number }>();
 	const edges: { from: string; to: string }[] = [];
@@ -588,17 +605,36 @@ function buildImportGraph(root: string) {
 			(nodes.get(toId) as { indeg: number }).indeg++;
 		}
 	}
-	const list = [...nodes.values()];
-	return { nodes: list, edges };
+	let list = [...nodes.values()];
+	let outEdges = edges;
+	if (!includeTests) {
+		// Remove test nodes + their edges entirely (not just flag them), matching
+		// the Graph view, then recompute degrees on the trimmed edge set.
+		const drop = new Set(list.filter((n) => n.type !== "lib" && isTestFile(n.id)).map((n) => n.id));
+		if (drop.size) {
+			list = list.filter((n) => !drop.has(n.id));
+			outEdges = edges.filter((e) => !drop.has(e.from) && !drop.has(e.to));
+			for (const n of list) { n.indeg = 0; n.outdeg = 0; }
+			const byId = new Map(list.map((n) => [n.id, n]));
+			for (const e of outEdges) {
+				const f = byId.get(e.from); if (f) f.outdeg++;
+				const t = byId.get(e.to); if (t) t.indeg++;
+			}
+		}
+	}
+	return { nodes: list, edges: outEdges };
 }
 
 server.tool(
 	"vcqa_graph",
-	"Get the project's module dependency graph — the nodes and edges the monitor's Graph view draws. Nodes are files (type module|ui) and external libs (type lib); edges are imports. Use to see who imports/depends on a file.",
-	{ path: z.string().optional().describe("Project directory (defaults to cwd)") },
-	async ({ path }) => {
+	"Get the project's module dependency graph — the nodes and edges the monitor's Graph view draws. Nodes are files (type module|ui) and external libs (type lib); edges are imports. Use to see who imports/depends on a file. Test/spec files are excluded by default (they live in the Tests view, not the structure) — pass include_tests to add them.",
+	{
+		path: z.string().optional().describe("Project directory (defaults to cwd)"),
+		include_tests: z.boolean().optional().describe("Include *.test/*.spec and test-folder files as nodes (default false, matching the Graph view)"),
+	},
+	async ({ path, include_tests }) => {
 		const cwd = resolve(path || process.cwd());
-		const g = buildImportGraph(cwd);
+		const g = buildImportGraph(cwd, include_tests ?? false);
 		const byType: Record<string, number> = {};
 		for (const n of g.nodes) byType[n.type] = (byType[n.type] || 0) + 1;
 		const mostConnected = [...g.nodes]
@@ -610,6 +646,155 @@ server.tool(
 			content: [{
 				type: "text" as const,
 				text: JSON.stringify({ summary: { nodes: g.nodes.length, edges: g.edges.length, byType }, mostConnected, nodes: g.nodes, edges: g.edges }, null, 2),
+			}],
+		};
+	},
+);
+
+// ── Tool: vcqa_architecture (React layers — the Architecture view) ──
+// Builds a real call graph with graphify (local, no-LLM) and reshapes it into the
+// same layered model the monitor's Architecture view draws: symbols bucketed into
+// Routes → Components → Hooks → State → Services → Lib → Data, plus the call/import
+// flow between layers. graphify must be installed (`uv tool install graphifyy`).
+
+/** Locate the graphify binary (PATH via `command -v`, then the uv-tool default
+ *  ~/.local/bin). The `command -v graphify` argument is a fixed string — no user
+ *  input — so the shell here is safe. */
+function findGraphify(): string | null {
+	try { return execSync("command -v graphify", { encoding: "utf-8" }).trim() || null; }
+	catch { /* not on PATH */ }
+	const local = join(homedir(), ".local", "bin", "graphify");
+	return existsSync(local) ? local : null;
+}
+
+/** Run graphify on a project and return its extraction graph, or an error string.
+ *  Uses execFileSync (no shell) so a project path with spaces or shell
+ *  metacharacters can't be misinterpreted or injected. */
+function loadGraphifyGraph(cwd: string): { graph?: GraphifyGraph; error?: string } {
+	const bin = findGraphify();
+	if (!bin) return { error: "graphify not installed. Install it with: uv tool install graphifyy" };
+	if (!existsSync(cwd) || !statSync(cwd).isDirectory()) return { error: `Not a directory: ${cwd}` };
+	try {
+		execFileSync(bin, ["update", cwd, "--no-cluster"], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 });
+	} catch (e) { return { error: `graphify failed: ${(e as Error).message}` }; }
+	const graphPath = join(cwd, "graphify-out", "graph.json");
+	if (!existsSync(graphPath)) return { error: "graphify produced no graph.json" };
+	let parsed: unknown;
+	try { parsed = JSON.parse(readFileSync(graphPath, "utf-8")); }
+	catch (e) { return { error: `unreadable graph.json: ${(e as Error).message}` }; }
+	if (!parsed || typeof parsed !== "object") return { error: "graph.json was not a graph object" };
+	const g = parsed as Partial<GraphifyGraph>;
+	// Tolerate graphify schema drift: coerce to arrays so downstream never throws.
+	return { graph: { nodes: Array.isArray(g.nodes) ? g.nodes : [], links: Array.isArray(g.links) ? g.links : [] } };
+}
+
+server.tool(
+	"vcqa_architecture",
+	"Map the project's React architecture into layers (Routes/Pages, Components, Hooks, State/Context, Services/API, Lib/Utils, Data/DB) plus the call/import flow between layers — the same model the monitor's Architecture view shows. Symbols are classified by kind (component/hook/service/type…) from a real call graph built locally by graphify. Use to understand what layers exist, which hooks/services are defined, and how they call each other. Requires graphify (`uv tool install graphifyy`).",
+	{
+		path: z.string().optional().describe("Project directory (defaults to cwd)"),
+	},
+	async ({ path }) => {
+		const cwd = resolve(path || process.cwd());
+		const { graph, error } = loadGraphifyGraph(cwd);
+		if (error) return { content: [{ type: "text" as const, text: JSON.stringify({ error }) }], isError: true };
+
+		const model = buildArchitecture(graph);
+		// A compact projection: layer sizes + member names + the flow list, so the
+		// agent gets the shape without the full node payload.
+		const layers = model.layers.map((l) => ({
+			id: l.id, label: l.label, count: l.nodes.length,
+			members: l.nodes.map((n) => ({ name: n.name, kind: n.kind })),
+		}));
+		return {
+			content: [{
+				type: "text" as const,
+				text: JSON.stringify({ stats: model.stats, layers, flows: model.flows }, null, 2),
+			}],
+		};
+	},
+);
+
+// ── Tool: vcqa_callflow (real function-call tree — the Flow view) ──
+// Traces how calls actually flow through the code: pick an entry symbol and see
+// its downstream call tree (graphify `calls` edges, function-level). With no root,
+// lists the entry points (symbols nothing calls / components/hooks) ranked by reach.
+
+server.tool(
+	"vcqa_callflow",
+	"Trace how function calls actually flow through the project — the monitor's Flow view. With no `root`, returns the entry points (symbols nothing calls, or components/hooks) ranked by how many symbols they reach. With a `root` (a function/component/hook name or id), returns its downstream call tree: each reached symbol with its call depth, plus the caller→callee edges. Use to answer 'what does X actually call?' and to see execution paths through the layers. Requires graphify (`uv tool install graphifyy`).",
+	{
+		path: z.string().optional().describe("Project directory (defaults to cwd)"),
+		root: z.string().optional().describe("Entry symbol to trace from (function/component/hook name or id). Omit to list entry points."),
+		max_depth: z.number().optional().describe("Max call depth to follow when tracing (default 6)"),
+	},
+	async ({ path, root, max_depth }) => {
+		const cwd = resolve(path || process.cwd());
+		const { graph, error } = loadGraphifyGraph(cwd);
+		if (error) return { content: [{ type: "text" as const, text: JSON.stringify({ error }) }], isError: true };
+
+		const cg = buildCallGraph(graph);
+		if (!root) {
+			const eps = entryPoints(cg).slice(0, 40).map((e) => ({ name: e.name, kind: e.kind, layer: e.layer, reach: e.reach, file: e.file }));
+			return { content: [{ type: "text" as const, text: JSON.stringify({ entryPoints: eps, note: "Pass root=<name> to trace a symbol's downstream call tree." }, null, 2) }] };
+		}
+		const rootId = resolveRoot(cg, root);
+		if (!rootId) {
+			const suggest = entryPoints(cg).slice(0, 8).map((e) => e.name);
+			return { content: [{ type: "text" as const, text: JSON.stringify({ error: `No callable symbol named "${root}". Try one of: ${suggest.join(", ")}` }) }], isError: true };
+		}
+		const trace = traceFrom(cg, rootId, { maxDepth: max_depth ?? 6 });
+		const byId = new Map(trace.nodes.map((n) => [n.id, n.name]));
+		return {
+			content: [{
+				type: "text" as const,
+				text: JSON.stringify({
+					root: cg.nodes.get(rootId)!.name,
+					truncated: trace.truncated,
+					symbols: trace.nodes.map((n) => ({ name: n.name, kind: n.kind, layer: n.layer, depth: n.depth, file: n.file })),
+					calls: trace.edges.map((e) => ({ from: byId.get(e.from), to: byId.get(e.to) })),
+				}, null, 2),
+			}],
+		};
+	},
+);
+
+// ── Tool: vcqa_sequence (static sequence approximation — the Sequence view) ──
+// Linearizes a symbol's call tree into execution order (DFS pre-order) and returns
+// it as a Mermaid sequenceDiagram plus the ordered steps. Static — no branch/loop/
+// await semantics — but reads like a sequence of who-calls-whom.
+
+server.tool(
+	"vcqa_sequence",
+	"Approximate a sequence diagram for a symbol: trace its calls in execution order (DFS pre-order — each call fully expanded before the next) and return a Mermaid `sequenceDiagram` plus the ordered steps. This is a STATIC approximation (no branches/loops/await), but shows the who-calls-whom order through the code. Requires a `root` symbol (function/component/hook name or id) and graphify (`uv tool install graphifyy`).",
+	{
+		path: z.string().optional().describe("Project directory (defaults to cwd)"),
+		root: z.string().describe("Entry symbol to sequence from (function/component/hook name or id)"),
+		max_depth: z.number().optional().describe("Max call depth to follow (default 6)"),
+	},
+	async ({ path, root, max_depth }) => {
+		const cwd = resolve(path || process.cwd());
+		const { graph, error } = loadGraphifyGraph(cwd);
+		if (error) return { content: [{ type: "text" as const, text: JSON.stringify({ error }) }], isError: true };
+
+		const cg = buildCallGraph(graph);
+		const rootId = resolveRoot(cg, root);
+		if (!rootId) {
+			const suggest = entryPoints(cg).slice(0, 8).map((e) => e.name);
+			return { content: [{ type: "text" as const, text: JSON.stringify({ error: `No callable symbol named "${root}". Try one of: ${suggest.join(", ")}` }) }], isError: true };
+		}
+		const seq = buildSequence(cg, rootId, { maxDepth: max_depth ?? 6 });
+		const nameOf = new Map(seq.participants.map((p) => [p.id, p.name]));
+		return {
+			content: [{
+				type: "text" as const,
+				text: JSON.stringify({
+					root: seq.root,
+					truncated: seq.truncated,
+					participants: seq.participants.map((p) => ({ name: p.name, kind: p.kind, layer: p.layer })),
+					steps: seq.steps.map((s) => ({ from: nameOf.get(s.from), to: nameOf.get(s.to), depth: s.depth })),
+					mermaid: toMermaid(seq),
+				}, null, 2),
 			}],
 		};
 	},

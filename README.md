@@ -35,11 +35,18 @@ npx @vibecodeqa/mcp
 
 ## One shared lens
 
-This server is meant to be the **single interface** through which an agent observes a
+This server is the **single interface** through which an agent observes a
 project — so an external agent (Claude Code, Cursor) and the desktop monitor's own
 Copilot see exactly the same thing. Observe a target project *through these tools*; if
 a capability is missing, add a tool here rather than reaching around into the repo or the
 app's private storage.
+
+The **in-app Copilot consumes this server directly**: the Tauri app spawns it as a
+stdio JSON-RPC client (`src-tauri/src/mcp_client.rs`) and the copilot agent merges the
+tool list into its own toolbelt, routing every `vcqa_*` call through `tools/call` with
+the watched folder passed as `path`. It skips the tools that observe/steer the app
+itself (`vcqa_app_state`, `vcqa_copilot_thread`, `vcqa_copilot_send`) and `vcqa_fix`.
+So adding a tool here gives it to Claude Code *and* the Copilot at once.
 
 ## Tools
 
@@ -63,6 +70,14 @@ app's private storage.
 | `vcqa_list_files` | List project files (the Files-view inventory), filter by ext/substring |
 | `vcqa_grep` | Regex-search the project's source → `file:line: text` |
 | `vcqa_graph` | Module dependency graph — the Graph view's nodes (module/ui/lib) and import edges |
+
+**Structure** (React architecture, from a local [graphify](https://github.com/Graphify-Labs/graphify) call graph — `uv tool install graphifyy`):
+
+| Tool | Description |
+|------|-------------|
+| `vcqa_architecture` | React layers (Routes/Components/Hooks/State/Services/Lib/Data) + inter-layer call flow — the Layers view |
+| `vcqa_callflow` | Real function-call tree from an entry symbol; no `root` → entry points ranked by reach — the Flow view |
+| `vcqa_sequence` | Static sequence diagram (Mermaid) for a symbol's call order — the Sequence view |
 
 **Live app state** (what's on the user's screen — macOS desktop app):
 
