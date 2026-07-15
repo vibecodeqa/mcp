@@ -22,6 +22,25 @@ export interface GraphifyGraph {
 	links: GraphifyEdge[];
 }
 
+/** True if a path lives under a hidden/dot directory (.claude, .vscode, .git, …). */
+export function isHiddenPath(file: string | undefined | null): boolean {
+	if (!file) return false;
+	return file.replace(/\\/g, "/").split("/").some((seg) => seg.startsWith("."));
+}
+
+/**
+ * Drop nodes whose source file lives under a hidden/tooling directory (.claude,
+ * .vscode, .github, …) and any link touching them. graphify walks the whole repo
+ * including dotfolders, but those are config/tooling, not application source.
+ */
+export function stripHiddenNodes(graph: GraphifyGraph | null | undefined): GraphifyGraph {
+	const nodes = Array.isArray(graph?.nodes) ? graph!.nodes : [];
+	const links = Array.isArray(graph?.links) ? graph!.links : [];
+	const kept = nodes.filter((n) => n && !isHiddenPath(n.source_file));
+	const keptIds = new Set(kept.map((n) => n.id));
+	return { nodes: kept, links: links.filter((l) => l && keptIds.has(l.source) && keptIds.has(l.target)) };
+}
+
 export type LayerId = "pages" | "components" | "hooks" | "state" | "services" | "lib" | "data";
 export type NodeKind = "component" | "hook" | "page" | "store" | "service" | "util" | "type" | "file" | "other";
 

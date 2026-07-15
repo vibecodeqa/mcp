@@ -34,7 +34,7 @@ import { execFileSync, execSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, extname, join, relative, resolve } from "node:path";
-import { buildArchitecture, type GraphifyGraph } from "./architecture.js";
+import { buildArchitecture, stripHiddenNodes, type GraphifyGraph } from "./architecture.js";
 import { buildCallGraph, entryPoints, resolveRootMatches, traceFrom } from "./callflow.js";
 import { buildSequence, toMermaid } from "./sequence.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -685,7 +685,9 @@ function loadGraphifyGraph(cwd: string): { graph?: GraphifyGraph; error?: string
 	if (!parsed || typeof parsed !== "object") return { error: "graph.json was not a graph object" };
 	const g = parsed as Partial<GraphifyGraph>;
 	// Tolerate graphify schema drift: coerce to arrays so downstream never throws.
-	return { graph: { nodes: Array.isArray(g.nodes) ? g.nodes : [], links: Array.isArray(g.links) ? g.links : [] } };
+	// Strip nodes under hidden/tooling dirs (.claude, .vscode, .github, …) so the
+	// architecture/callflow/sequence tools describe application source only.
+	return { graph: stripHiddenNodes({ nodes: Array.isArray(g.nodes) ? g.nodes : [], links: Array.isArray(g.links) ? g.links : [] }) };
 }
 
 server.tool(
