@@ -856,12 +856,17 @@ function readStoreValue(db: string, key: string): string | null {
 }
 
 const VIEW_LABELS: Record<string, string> = {
-	overview: "Health", files: "Files", canopy: "Graph", complexity: "Complexity",
+	overview: "Dashboard", files: "Files", canopy: "Graph", complexity: "Complexity",
 	"duplicate-files": "Duplicate Files", "duplicate-code": "Duplicate Code",
 	clones: "Duplicate Code", types: "Types", schema: "Schema", lint: "Lint",
-	security: "Security", deps: "Deps", tests: "Tests", trends: "Trends",
+	security: "Security", deps: "Deps", tests: "Tests", trends: "Dashboard",
 	activity: "Activity", settings: "Settings",
 };
+function normalizeMonitorPage(page: string | undefined): string {
+	if (page === "clones") return "duplicate-code";
+	if (page === "trends") return "overview";
+	return page || "overview";
+}
 
 // ── Tool: vcqa_app_state ──
 server.tool(
@@ -900,7 +905,8 @@ server.tool(
 		if (!rawVal) return { content: [{ type: "text" as const, text: "No copilot threads yet." }] };
 		let all: Record<string, { role: string; text?: string; toolCalls?: { name?: string }[] }[]>;
 		try { all = JSON.parse(rawVal); } catch { return { content: [{ type: "text" as const, text: "Could not parse copilot threads." }], isError: true }; }
-		const pick = page ? { [page]: all[page] ?? [] } : all;
+		const normalizedPage = page ? normalizeMonitorPage(page) : undefined;
+		const pick = normalizedPage ? { [normalizedPage]: all[normalizedPage] ?? [] } : all;
 		const out: Record<string, unknown[]> = {};
 		for (const [pg, msgs] of Object.entries(pick)) {
 			out[pg] = (msgs || []).map((m) => ({
@@ -919,7 +925,7 @@ server.tool(
 	"Send a message to the running monitor's in-app copilot on a given page — as if the user typed it — and return the copilot's reply. The exchange also appears in the app UI. Requires the desktop monitor to be running. Write actions (issues/notes) never fire on a sent message.",
 	{
 		text: z.string().describe("The message to send to the copilot"),
-		page: z.string().optional().describe("Page id: 'canopy' (Graph), 'schema', 'complexity', 'overview' (default), …"),
+		page: z.string().optional().describe("Page id: 'overview' (Dashboard, default), 'canopy' (Graph), 'schema', 'complexity', …"),
 		timeout_s: z.number().optional().describe("How long to wait for the reply (default 90s)"),
 	},
 	async ({ text, page, timeout_s }) => {
@@ -931,7 +937,7 @@ server.tool(
 		const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 		const reqPath = join(reqDir, `${id}.json`);
 		const resPath = join(resDir, `${id}.json`);
-		writeFileSync(reqPath, JSON.stringify({ id, page: page || "overview", text }));
+		writeFileSync(reqPath, JSON.stringify({ id, page: normalizeMonitorPage(page), text }));
 		const deadline = Date.now() + (timeout_s ?? 90) * 1000;
 		while (Date.now() < deadline) {
 			if (existsSync(resPath)) {
