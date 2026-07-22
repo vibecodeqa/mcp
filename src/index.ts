@@ -857,7 +857,8 @@ function readStoreValue(db: string, key: string): string | null {
 
 const VIEW_LABELS: Record<string, string> = {
 	overview: "Health", files: "Files", canopy: "Graph", complexity: "Complexity",
-	clones: "Clones", types: "Types", schema: "Schema", lint: "Lint",
+	"duplicate-files": "Duplicate Files", "duplicate-code": "Duplicate Code",
+	clones: "Duplicate Code", types: "Types", schema: "Schema", lint: "Lint",
 	security: "Security", deps: "Deps", tests: "Tests", trends: "Trends",
 	activity: "Activity", settings: "Settings",
 };
