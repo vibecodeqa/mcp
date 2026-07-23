@@ -8,6 +8,15 @@ on:
       - 'package.json'
       - '.github/workflows/publish.yml'
   workflow_dispatch:
+    inputs:
+      publish_mode:
+        description: "Publish mode: oidc or bootstrap-token"
+        required: true
+        default: oidc
+        type: choice
+        options:
+          - oidc
+          - bootstrap-token
 
 permissions:
   contents: read
@@ -48,6 +57,12 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Publish via one-time npm token
+        if: steps.decide.outputs.publish == 'true' && github.event_name == 'workflow_dispatch' && inputs.publish_mode == 'bootstrap-token'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
       - name: Publish via OIDC trusted publishing
-        if: steps.decide.outputs.publish == 'true'
+        if: steps.decide.outputs.publish == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.publish_mode == 'bootstrap-token')
         run: npm publish --access public --provenance
