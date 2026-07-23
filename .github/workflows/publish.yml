@@ -64,5 +64,11 @@ jobs:
         run: npm publish --access public
 
       - name: Publish via OIDC trusted publishing
-        if: steps.decide.outputs.publish == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.publish_mode == 'bootstrap-token')
+        if: ${{ steps.decide.outputs.publish == 'true' && ((github.event_name == 'workflow_dispatch' && inputs.publish_mode == 'oidc') || (github.event_name == 'push' && vars.NPM_TRUSTED_PUBLISHING_ENABLED == 'true')) }}
         run: npm publish --access public --provenance
+
+      - name: Skip publish until npm trust is configured
+        if: ${{ steps.decide.outputs.publish == 'true' && github.event_name == 'push' && vars.NPM_TRUSTED_PUBLISHING_ENABLED != 'true' }}
+        run: |
+          echo "Build passed."
+          echo "Publishing is skipped until NPM_TRUSTED_PUBLISHING_ENABLED=true or workflow_dispatch publish_mode=bootstrap-token is used."
