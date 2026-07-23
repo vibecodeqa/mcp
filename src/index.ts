@@ -7,7 +7,7 @@
  * Code, Cursor, …) share one toolbelt over the same project.
  * Tools:
  *   vcqa_score       — Quick score + grade (fastest, uses cache)
- *   vcqa_scan        — Full scan with all 34 check results
+ *   vcqa_scan        — Full scan with all check results
  *   vcqa_file_health — Get issues for a specific file
  *   vcqa_check       — Get details for a specific check
  *   vcqa_explain     — Explain what a check measures and how to fix it
@@ -39,59 +39,24 @@ import { buildCallGraph, entryPoints, resolveRootMatches, traceFrom } from "./ca
 import { buildSequence, toMermaid } from "./sequence.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CHECK_META, parseReport, type VibeReport } from "@vibecodeqa/schema";
 import { z } from "zod";
 
-interface ScanReport {
-	score: number;
-	grade: string;
-	version?: string;
-	checks: {
-		name: string;
-		score: number;
-		grade: string;
-		details: Record<string, unknown>;
-		issues: { severity: string; message: string; file?: string; line?: number; rule?: string }[];
-		duration: number;
-	}[];
-	meta: Record<string, unknown>;
-}
-
-// Check metadata — embedded to avoid shelling out for explain
-const CHECK_META: Record<string, { label: string; category: string; weight: number; description: string; risk: string; recommendation: string }> = {
-	structure: { label: "Project Structure", category: "Foundations", weight: 6, description: "Checks for standard project files: package.json, tsconfig.json, LICENSE, README, .gitignore, lockfile. Verifies test-to-source ratio.", risk: "Missing config files cause build failures in CI. No lockfile means non-reproducible builds.", recommendation: "Ensure every project has package.json, tsconfig.json, LICENSE, .gitignore, and a lockfile." },
-	lint: { label: "Lint", category: "Foundations", weight: 5, description: "Runs the project's linter (Biome or ESLint) and counts errors and warnings.", risk: "Unlinted code accumulates inconsistencies and latent bugs.", recommendation: "Fix all lint errors. Add Biome if no linter configured." },
-	types: { label: "Type Check", category: "Foundations", weight: 6, description: "Runs tsc --noEmit to find TypeScript compilation errors.", risk: "Type errors are bugs — every unresolved error is a potential runtime crash.", recommendation: "Fix all type errors. Enable strict mode." },
-	"type-safety": { label: "Type Safety", category: "Foundations", weight: 3, description: "Counts unsafe type patterns: 'as any', ': any', @ts-ignore, non-null assertions.", risk: "'as any' silences the type checker. Accumulated any usage correlates with higher defect density.", recommendation: "Replace 'as any' with proper types or type guards." },
-	standards: { label: "Code Standards", category: "Foundations", weight: 3, description: "Checks naming conventions, file size, code smells (console.log, var, ==, eval).", risk: "Large files are hard to review. console.log in production leaks data.", recommendation: "Split files over 300 lines. Use const/let, ===, and safe DOM APIs." },
-	complexity: { label: "Complexity", category: "Quality", weight: 5, description: "Measures cognitive complexity per function.", risk: "Complex functions are the #1 source of bugs.", recommendation: "Extract complex functions into smaller ones. Use early returns." },
-	duplication: { label: "Duplication", category: "Quality", weight: 5, description: "Detects copy-pasted code blocks of 6+ lines.", risk: "Duplicated code means bugs must be fixed in multiple places.", recommendation: "Extract duplicated logic into shared functions." },
-	"error-handling": { label: "Error Handling", category: "Quality", weight: 3, description: "Detects empty catch, throw string, floating promises, unsafe JSON.parse.", risk: "Empty catch blocks silently swallow errors.", recommendation: "Handle or log every catch. Use throw new Error()." },
-	react: { label: "React Patterns", category: "Quality", weight: 3, description: "Checks conditional hooks, missing keys, index as key, prop spreading.", risk: "Conditional hooks crash React. Missing keys cause incorrect reconciliation.", recommendation: "Never call hooks inside conditions. Always provide stable keys." },
-	accessibility: { label: "Accessibility", category: "Quality", weight: 4, description: "Checks img alt, click handlers without keyboard, unlabeled forms.", risk: "1 in 4 adults has a disability.", recommendation: "Add alt text. Use <button> for clickable elements." },
-	docs: { label: "Documentation", category: "Quality", weight: 3, description: "Checks README quality and JSDoc coverage.", risk: "Undocumented code is hard to onboard to.", recommendation: "Write README with install/usage. Add JSDoc to public exports." },
-	"best-practices": { label: "Best Practices", category: "Quality", weight: 3, description: "CI/CD, supply chain, OIDC, pinned actions, SECURITY.md, CODEOWNERS.", risk: "Missing CI practices lead to supply chain attacks.", recommendation: "Pin actions to SHA. Use OIDC. Add SECURITY.md." },
-	testing: { label: "Testing", category: "Testing", weight: 15, description: "Test pyramid, execution, coverage, file pairing, quality metrics.", risk: "Code without tests is code you can't safely change.", recommendation: "Follow testing pyramid. Aim for >80% branch coverage." },
-	secrets: { label: "Secrets", category: "Security", weight: 6, description: "Scans for hardcoded secrets: AWS, GitHub, Stripe, OpenAI keys. Delegates to gitleaks.", risk: "Hardcoded secrets are the #1 cause of credential leaks.", recommendation: "Use environment variables or a secret manager." },
-	security: { label: "Security Patterns", category: "Security", weight: 5, description: "31 CWE patterns: XSS, injection, weak crypto, prototype pollution, path traversal.", risk: "These patterns represent OWASP Top 10 vulnerabilities.", recommendation: "Replace innerHTML with textContent. Never use eval(). Use parameterized queries." },
-	dependencies: { label: "Dependencies", category: "Security", weight: 5, description: "npm audit for CVEs, outdated package detection.", risk: "Vulnerable dependencies are the most common supply chain attack vector.", recommendation: "Run audit regularly. Use Dependabot or Renovate." },
-	architecture: { label: "Architecture", category: "Architecture", weight: 5, description: "Circular deps, god modules, orphans, fan-out, import graph analysis.", risk: "Circular deps make refactoring impossible. God modules become bottlenecks.", recommendation: "Break circular deps. Split god modules by concern." },
-	performance: { label: "Performance", category: "Architecture", weight: 4, description: "Barrel imports, heavy deps, dynamic import opportunities, CSS-in-JS overhead.", risk: "Barrel files prevent tree-shaking, bloating bundles 2-10x.", recommendation: "Replace barrel re-exports with direct imports." },
-	confusion: { label: "Confusion Index", category: "LLM Readiness", weight: 6, description: "Naming ambiguity that causes LLMs to misunderstand code.", risk: "LLMs drop 28.6% on code tasks when names are ambiguous.", recommendation: "Use descriptive, unique names. Avoid synonym files." },
-	context: { label: "Context Locality", category: "LLM Readiness", weight: 5, description: "Token density, import depth, circular dep impact on LLM navigation.", risk: "Files over 4000 tokens exceed the LLM attention sweet spot.", recommendation: "Keep files under 400 lines. Limit imports to <15 per file." },
-	"doc-coherence": { label: "Doc Coherence", category: "AI Analysis", weight: 0, description: "LLM-powered: stale README claims, incorrect JSDoc, outdated CHANGELOG.", risk: "Stale docs actively mislead developers and LLMs.", recommendation: "Pro feature — set VCQA_PRO_KEY." },
-	"code-coherence": { label: "Code Coherence", category: "AI Analysis", weight: 0, description: "LLM-powered: inconsistent validation, conflicting defaults, naming drift.", risk: "Incoherent codebases cause 'works on my machine' bugs.", recommendation: "Pro feature — set VCQA_PRO_KEY." },
-	"comment-staleness": { label: "Comment Staleness", category: "AI Analysis", weight: 0, description: "Stale TODOs, numeric mismatches, commented-out code, @deprecated without replacement.", risk: "Stale comments mislead developers and AI agents.", recommendation: "Delete old TODOs. Remove commented-out code." },
-	"dead-patterns": { label: "Dead Patterns", category: "AI Analysis", weight: 0, description: "Leftover code from incomplete refactors: fallbacks, parallel impls, dead guards.", risk: "Vibe-coded projects accumulate dead patterns fast.", recommendation: "Pro feature — set VCQA_PRO_KEY." },
-	"test-audit": { label: "Test Audit", category: "AI Analysis", weight: 0, description: "Fake/shallow tests: empty bodies, trivial assertions, mock abuse.", risk: "AI-generated tests often look real but test nothing.", recommendation: "Pro feature — set VCQA_PRO_KEY." },
-};
-
 // Cache scan results to avoid re-scanning on every tool call
-let cachedReport: ScanReport | null = null;
+let cachedReport: VibeReport | null = null;
 let cachedCwd: string | null = null;
 let cachedAt = 0;
 const CACHE_TTL = 60_000; // 1 minute
 
-function runScan(cwd: string): ScanReport {
+function parseScanReport(json: unknown): VibeReport {
+	try {
+		return parseReport(json);
+	} catch (err) {
+		throw new Error(`invalid vcqa report: ${err instanceof Error ? err.message : String(err)}`);
+	}
+}
+
+function runScan(cwd: string): VibeReport {
 	const now = Date.now();
 	if (cachedReport && cachedCwd === cwd && now - cachedAt < CACHE_TTL) {
 		return cachedReport;
@@ -103,7 +68,7 @@ function runScan(cwd: string): ScanReport {
 		try {
 			const stat = statSync(reportPath);
 			if (now - stat.mtimeMs < 300_000) {
-				const report = JSON.parse(readFileSync(reportPath, "utf-8")) as ScanReport;
+				const report = parseScanReport(JSON.parse(readFileSync(reportPath, "utf-8")));
 				cachedReport = report;
 				cachedCwd = cwd;
 				cachedAt = now;
@@ -120,7 +85,7 @@ function runScan(cwd: string): ScanReport {
 			timeout: 60_000,
 			stdio: ["pipe", "pipe", "pipe"],
 		});
-		const report = JSON.parse(stdout) as ScanReport;
+		const report = parseScanReport(JSON.parse(stdout));
 		cachedReport = report;
 		cachedCwd = cwd;
 		cachedAt = now;
@@ -165,7 +130,7 @@ server.tool(
 // ── Tool: vcqa_scan ──
 server.tool(
 	"vcqa_scan",
-	"Run a full code health scan. Returns score, grade, and all 34 check results with issues. Use vcqa_score for a quicker summary.",
+	`Run a full code health scan. Returns score, grade, and all ${Object.keys(CHECK_META).length} check results with issues. Use vcqa_score for a quicker summary.`,
 	{ path: z.string().optional().describe("Project directory path (defaults to cwd)") },
 	async ({ path }) => {
 		const cwd = path || process.cwd();
@@ -344,9 +309,9 @@ server.tool(
 		const reportPath = join(cwd, ".vibe-check", "report.json");
 
 		// Load previous report
-		let prevReport: ScanReport | null = null;
+		let prevReport: VibeReport | null = null;
 		if (existsSync(reportPath)) {
-			try { prevReport = JSON.parse(readFileSync(reportPath, "utf-8")) as ScanReport; } catch { /* corrupt */ }
+			try { prevReport = parseScanReport(JSON.parse(readFileSync(reportPath, "utf-8"))); } catch { /* corrupt */ }
 		}
 
 		if (!prevReport) {
@@ -396,8 +361,8 @@ server.tool(
 
 		const scoreDelta = currentReport.score - prevReport.score;
 		const checkChanges = currentReport.checks
-			.map((c: ScanReport["checks"][0]) => {
-				const prev = prevReport!.checks.find((p: ScanReport["checks"][0]) => p.name === c.name);
+			.map((c) => {
+				const prev = prevReport!.checks.find((p) => p.name === c.name);
 				return { name: c.name, before: prev?.score ?? 0, after: c.score, delta: c.score - (prev?.score ?? 0) };
 			})
 			.filter((c: { delta: number }) => c.delta !== 0)
