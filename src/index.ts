@@ -31,7 +31,12 @@
  */
 
 import { execFileSync, execSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+
+/** Pinned scan engine. Bump deliberately (with a changelog entry) — an unpinned
+ *  `npx @vibecodeqa/cli` floats to whatever npx resolves and changes results
+ *  under every consumer with no change in this repo (issue #2). */
+const CLI_SPEC = "@vibecodeqa/cli@^0.45.0";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { buildArchitecture, stripHiddenNodes, type GraphifyGraph } from "./architecture.js";
@@ -79,7 +84,7 @@ function runScan(cwd: string): VibeReport {
 
 	// Run live scan
 	try {
-		const stdout = execSync("npx @vibecodeqa/cli --skip-tests --json .", {
+		const stdout = execFileSync("npx", ["--yes", CLI_SPEC, "--skip-tests", "--json", "."], {
 			cwd,
 			encoding: "utf-8",
 			timeout: 60_000,
@@ -270,7 +275,7 @@ server.tool(
 		flags.push(cwd);
 
 		try {
-			const stdout = execSync(`npx @vibecodeqa/cli ${flags.join(" ")}`, {
+			const stdout = execFileSync("npx", ["--yes", CLI_SPEC, ...flags], {
 				cwd,
 				encoding: "utf-8",
 				timeout: 120_000,
@@ -792,10 +797,10 @@ function findMonitorStore(): string | null {
 	try {
 		const base = join(homedir(), "Library", "WebKit");
 		if (!existsSync(base)) return null;
-		const found = execSync(`find "${base}" -name localstorage.sqlite3 -type f 2>/dev/null`, { encoding: "utf-8" }).trim();
+		const found = execFileSync("find", [base, "-name", "localstorage.sqlite3", "-type", "f"], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
 		for (const db of found.split("\n").filter(Boolean)) {
 			try {
-				const keys = execSync(`sqlite3 "${db}" "SELECT key FROM ItemTable LIMIT 300;" 2>/dev/null`, { encoding: "utf-8" });
+				const keys = execFileSync("sqlite3", [db, "SELECT key FROM ItemTable LIMIT 300;"], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
 				if (keys.includes("vcqa:monitor") || keys.includes("vibe-monitor.copilot")) { cachedStore = db; return db; }
 			} catch { /* locked / unreadable — try next */ }
 		}
@@ -808,15 +813,19 @@ function findMonitorStore(): string | null {
 function readStoreValue(db: string, key: string): string | null {
 	const tmp = join(tmpdir(), `vcqa-ls-${process.pid}.sqlite3`);
 	try {
-		execSync(`cp "${db}" "${tmp}" 2>/dev/null; for x in wal shm; do [ -f "${db}-$x" ] && cp "${db}-$x" "${tmp}-$x" 2>/dev/null; done; true`);
-		const hex = execSync(`sqlite3 "${tmp}" "SELECT hex(value) FROM ItemTable WHERE key='${key.replace(/'/g, "''")}';" 2>/dev/null`, { encoding: "utf-8" }).trim();
+		for (const suffix of ["", "-wal", "-shm"]) {
+			try { if (existsSync(db + suffix)) copyFileSync(db + suffix, tmp + suffix); } catch { /* best-effort */ }
+		}
+		const hex = execFileSync("sqlite3", [tmp, `SELECT hex(value) FROM ItemTable WHERE key='${key.replace(/'/g, "''")}';`], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
 		if (!hex) return null;
 		const buf = Buffer.from(hex, "hex");
 		let s = buf.toString("utf16le");
 		if (s.includes("�")) { const u8 = buf.toString("utf8"); if (!u8.includes("�")) s = u8; }
 		return s;
 	} catch { return null; } finally {
-		try { execSync(`rm -f "${tmp}" "${tmp}-wal" "${tmp}-shm"`); } catch { /* ignore */ }
+		for (const suffix of ["", "-wal", "-shm"]) {
+			try { rmSync(tmp + suffix, { force: true }); } catch { /* ignore */ }
+		}
 	}
 }
 
