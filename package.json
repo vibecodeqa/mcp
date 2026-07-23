@@ -1,7 +1,7 @@
 {
   "name": "@vibecodeqa/mcp",
   "version": "0.5.1",
-  "description": "MCP server for VibeCode QA \u2014 gives AI coding agents real-time code health context",
+  "description": "MCP server for VibeCode QA — gives AI coding agents real-time code health context",
   "type": "module",
   "bin": {
     "vcqa-mcp": "./dist/index.js"
@@ -34,12 +34,12 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@vibecodeqa/schema": "^0.2.0",
-    "zod": "^3.25.32"
+    "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@types/node": "^22.15.0",
-    "typescript": "^5.8.3"
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.3"
   }
 }
