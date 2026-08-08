@@ -100,9 +100,26 @@ function runScan(cwd: string): VibeReport {
 	}
 }
 
+/** The version advertised in the MCP `initialize` handshake. Read from
+ *  package.json rather than hardcoded, because the hardcoded copy had already
+ *  drifted (package.json 0.5.1 vs handshake 0.5.0) and would drift again on
+ *  every release. `dist/index.js` → `../package.json` resolves to the package
+ *  root both in this repo and in the npm tarball (npm always ships
+ *  package.json, regardless of the `files` allowlist). */
+function packageVersion(): string {
+	try {
+		const pkg = JSON.parse(
+			readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+		) as { version?: unknown };
+		return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+	} catch {
+		return "0.0.0";
+	}
+}
+
 const server = new McpServer({
 	name: "vcqa",
-	version: "0.5.0",
+	version: packageVersion(),
 });
 
 // ── Tool: vcqa_score ──

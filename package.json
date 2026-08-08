@@ -1,6 +1,6 @@
 {
   "name": "@vibecodeqa/mcp",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "MCP server for VibeCode QA — gives AI coding agents real-time code health context",
   "type": "module",
   "bin": {
