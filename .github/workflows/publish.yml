@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'src/**'
+      - 'test/**'
       - 'package.json'
       - '.github/workflows/publish.yml'
   workflow_dispatch:
@@ -43,6 +44,13 @@ jobs:
 
       - name: Build
         run: pnpm build && chmod +x dist/index.js
+
+      # OPS-CI-5: deploy jobs must build AND test before publishing. This boots
+      # the built server over stdio and asserts the handshake and the full tool
+      # list; it must stay above every publish step so a failure blocks the
+      # release (issue #4).
+      - name: Test
+        run: pnpm test
 
       - name: Decide whether to publish
         id: decide
