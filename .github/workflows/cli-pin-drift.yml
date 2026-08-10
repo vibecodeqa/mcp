@@ -1,0 +1,92 @@
+# Watches the pinned scan engine for drift (issue #5).
+#
+# `CLI_SPEC` in src/index.ts pins `@vibecodeqa/cli` to a minor line (a caret on a
+# 0.x version is a MINOR range). The pin is deliberate — an unpinned engine
+# changes every consumer's results with no change in this repo (#2) — but the
+# previous pin sat nine minors behind for months because nothing was watching.
+# "Bump deliberately" was an instruction with no trigger and no owner.
+#
+# This is the trigger: once a week, compare the published CLI against the pin and
+# file an issue when it has moved on. It does not bump anything itself — the bump
+# also needs a @vibecodeqa/schema check and a regenerated report fixture, which
+# is a judgement call, not a chore a bot should make.
+name: CLI pin drift
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # Mondays, 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Compare published CLI against the pin
+        id: drift
+        run: |
+          set -euo pipefail
+          # Parsed with node rather than sed/grep: the version sits inside a TS
+          # string literal, and `sed` basic-regex differs between GNU and BSD.
+          PINNED=$(node -e '
+            const fs = require("node:fs");
+            const src = fs.readFileSync("src/index.ts", "utf8");
+            const m = src.match(/const CLI_SPEC = "@vibecodeqa\/cli@\^?([0-9]+\.[0-9]+\.[0-9]+)"/);
+            if (!m) { console.error("CLI_SPEC not found in src/index.ts"); process.exit(1); }
+            process.stdout.write(m[1]);
+          ')
+          LATEST=$(npm view @vibecodeqa/cli version)
+          echo "pinned=$PINNED  latest=$LATEST"
+          PINNED_MINOR=${PINNED%.*}
+          LATEST_MINOR=${LATEST%.*}
+          {
+            echo "pinned=$PINNED"
+            echo "latest=$LATEST"
+            if [ "$PINNED_MINOR" = "$LATEST_MINOR" ]; then
+              echo "drifted=false"
+            else
+              echo "drifted=true"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: File an issue when the pin is behind
+        if: steps.drift.outputs.drifted == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: "CLI_SPEC pins @vibecodeqa/cli ${{ steps.drift.outputs.pinned }}, published is ${{ steps.drift.outputs.latest }}"
+          BODY: |
+            `CLI_SPEC` in `src/index.ts` pins `@vibecodeqa/cli@${{ steps.drift.outputs.pinned }}`;
+            the published version is `${{ steps.drift.outputs.latest }}`. A caret on a `0.x`
+            version is a minor range, so the pinned engine will not pick this up on its own.
+
+            To move the pin (see the `CLI_SPEC` comment for the full procedure):
+
+            1. Bump `CLI_SPEC` to the new minor.
+            2. Check `@vibecodeqa/schema` has `CHECK_META` for every check the new engine
+               emits — `vcqa_explain` / `vcqa_check` depend on it — and bump it too if not.
+            3. Regenerate `test/fixture/report-cli-<version>.json` from the newly pinned
+               engine. `pnpm test` fails until you do.
+            4. Note in the changelog whether users' scores move.
+
+            Filed automatically by `.github/workflows/cli-pin-drift.yml`.
+        run: |
+          set -euo pipefail
+          # Idempotent: don't stack a new issue every Monday for the same drift.
+          EXISTING=$(gh issue list --state open --label cli-pin-drift --json title \
+            --jq "[.[] | select(.title == \"$TITLE\")] | length")
+          if [ "$EXISTING" != "0" ]; then
+            echo "Issue already open for this drift; nothing to do."
+            exit 0
+          fi
+          gh label create cli-pin-drift --color ededed \
+            --description "Pinned scan engine is behind the published CLI" 2>/dev/null || true
+          gh issue create --title "$TITLE" --label cli-pin-drift --body "$BODY"

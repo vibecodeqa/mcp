@@ -32,10 +32,33 @@
 
 import { execFileSync, execSync } from "node:child_process";
 
-/** Pinned scan engine. Bump deliberately (with a changelog entry) — an unpinned
- *  `npx @vibecodeqa/cli` floats to whatever npx resolves and changes results
- *  under every consumer with no change in this repo (issue #2). */
-const CLI_SPEC = "@vibecodeqa/cli@^0.45.0";
+/** Pinned scan engine. An unpinned `npx @vibecodeqa/cli` floats to whatever npx
+ *  resolves and changes results under every consumer with no change in this
+ *  repo (issue #2), so the pin stays.
+ *
+ *  **A caret on a `0.x` version is a MINOR range, not a major one.** `^0.55.0`
+ *  resolves within `0.55.x` and nothing higher. That is the intended behaviour
+ *  — patch fixes reach consumers without an mcp release, minors do not — but it
+ *  is also how the previous pin sat on `^0.45.0` for nine minors without anyone
+ *  noticing (issue #5). Do not read this as "0.55 and up".
+ *
+ *  **When to move it:** on every `@vibecodeqa/cli` MINOR release. The pin is not
+ *  a compatibility barrier — there is no known breaking change between the CLI
+ *  and this server; it is a reproducibility barrier. Holding it back means
+ *  serving agents results from an engine with bugs that are already fixed
+ *  upstream, which is worse than the churn it avoids.
+ *
+ *  **How to move it:** bump this constant AND `@vibecodeqa/schema` in
+ *  package.json together — `vcqa_explain` / `vcqa_check` read `CHECK_META`, so a
+ *  CLI that emits a check the pinned schema has never heard of makes that check
+ *  unexplainable. Then regenerate `test/fixture/report-cli-<version>.json` from
+ *  the newly pinned engine; `test/report-compat.test.mjs` asserts the fixture
+ *  matches this pin and fails until you do, which is the trigger that makes the
+ *  next bump happen instead of waiting for an audit.
+ *
+ *  Drift is also watched by `.github/workflows/cli-pin-drift.yml`, which files
+ *  an issue when the published CLI minor moves past this pin. */
+const CLI_SPEC = "@vibecodeqa/cli@^0.55.0";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, extname, join, relative, resolve } from "node:path";
@@ -152,7 +175,11 @@ server.tool(
 // ── Tool: vcqa_scan ──
 server.tool(
 	"vcqa_scan",
-	`Run a full code health scan. Returns score, grade, and all ${Object.keys(CHECK_META).length} check results with issues. Use vcqa_score for a quicker summary.`,
+	// No check count here. It used to interpolate `Object.keys(CHECK_META).length`,
+	// which counts what the *schema* documents, not what the *engine* emits — the
+	// pinned CLI reports 38 checks against the pinned schema's 37 (it has no entry
+	// for `dead-code`), so any number stated here is advertised as fact and wrong.
+	"Run a full code health scan. Returns score, grade, and every check result with its issues. Use vcqa_score for a quicker summary.",
 	{ path: z.string().optional().describe("Project directory path (defaults to cwd)") },
 	async ({ path }) => {
 		const cwd = path || process.cwd();
