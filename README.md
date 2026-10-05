@@ -135,9 +135,26 @@ The agent fixes the security issue before committing.
 ## Performance
 
 - Uses cached `report.json` from previous CLI runs (< 5 min old)
-- Falls back to live scan via `npx @vibecodeqa/cli --skip-tests --json`
+- Falls back to live scan via `npx @vibecodeqa/cli@^0.57.0 --skip-tests --json`
 - In-memory cache with 60s TTL prevents redundant scans
 - Typical response: < 100ms (cached), 3-8s (live scan)
+
+## Scan engine version
+
+Live scans run a pinned `@vibecodeqa/cli`. The pin is a caret on the current
+CLI minor, currently `^0.57.0`. On a `0.x` version a caret is a minor range, so
+it resolves `0.57.x` and nothing higher.
+
+- **Patch releases** of the CLI reach users with no release of this package.
+- **Minor releases** need a release here. The pin moves together with
+  `@vibecodeqa/schema`, so every check the engine emits stays explainable, and
+  with the committed report fixture (`test/report-compat.test.mjs`). The new
+  engine's output is therefore tested before anyone is served it.
+- **Drift:** `.github/workflows/cli-pin-drift.yml` checks the published CLI
+  weekly and opens an issue when its minor is past the pin.
+
+A cached `.vibe-check/report.json` written by your own CLI is used as-is,
+whatever version produced it.
 
 ## Links
 

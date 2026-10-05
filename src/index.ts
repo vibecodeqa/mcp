@@ -36,11 +36,16 @@ import { execFileSync, execSync } from "node:child_process";
  *  resolves and changes results under every consumer with no change in this
  *  repo (issue #2), so the pin stays.
  *
- *  **A caret on a `0.x` version is a MINOR range, not a major one.** `^0.55.0`
- *  resolves within `0.55.x` and nothing higher. That is the intended behaviour
- *  — patch fixes reach consumers without an mcp release, minors do not — but it
- *  is also how the previous pin sat on `^0.45.0` for nine minors without anyone
- *  noticing (issue #5). Do not read this as "0.55 and up".
+ *  **Pin policy (issue #9): a caret on the current CLI minor.** A caret on a
+ *  `0.x` version is a MINOR range, not a major one: `^0.57.0` resolves within
+ *  `0.57.x` and nothing higher. That is the intended behaviour — patch fixes
+ *  reach consumers without an mcp release; a new minor needs one, with the
+ *  schema and the report fixture checked against it. The alternative,
+ *  `>=<floor> <1.0.0`, would pick up minors with no release here, but then the
+ *  engine that produces users' results is one this repo never tested. It is
+ *  also how the earlier pin sat on `^0.45.0` for nine minors unnoticed (issue
+ *  #5), which is why the drift workflow below exists. Do not read this as
+ *  "0.57 and up". The README records the same policy.
  *
  *  **When to move it:** on every `@vibecodeqa/cli` MINOR release. The pin is not
  *  a compatibility barrier — there is no known breaking change between the CLI
@@ -58,7 +63,7 @@ import { execFileSync, execSync } from "node:child_process";
  *
  *  Drift is also watched by `.github/workflows/cli-pin-drift.yml`, which files
  *  an issue when the published CLI minor moves past this pin. */
-const CLI_SPEC = "@vibecodeqa/cli@^0.55.0";
+const CLI_SPEC = "@vibecodeqa/cli@^0.57.0";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, extname, join, relative, resolve } from "node:path";
