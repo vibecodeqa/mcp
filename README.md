@@ -68,7 +68,9 @@ check's score is a placeholder rather than a measurement, the entry has **no
 did not run (`skipped` / `unavailable` → `"not run (<reason>)"`) and checks
 whose runner crashed (`failed` → `"failed (runner error: …)"`). `vcqa_delta`
 gives a numeric delta only when both scans have a real score, and lists
-anything else as a status change. `vcqa_scan` returns the raw report, where
+anything else as a status change. A crashed runner shows there as the short form
+`failed (runner error)`, without the reason text, because that text varies
+between runs and can contain local paths. `vcqa_scan` returns the raw report, where
 those checks still carry the CLI's placeholder score, so read `status` there.
 
 **Code** (read the same source the monitor shows):

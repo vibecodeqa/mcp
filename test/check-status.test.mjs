@@ -118,6 +118,12 @@ describe("vcqa_score / vcqa_check entries", () => {
 		});
 	}
 
+	it("collapses a multi-line runner-error reason to its first line", () => {
+		const stack = { ...crashed, details: { ...crashed.details, reason: "runner error: boom\n    at run (/Users/someone/x.js:1:1)\n    at main" } };
+		strictEqual(scoreEntry(stack).result, "failed (runner error: boom)");
+		strictEqual(checkResultFields(stack).result, "failed (runner error: boom)");
+	});
+
 	it("keeps score and grade for a check that ran", () => {
 		const entry = scoreEntry(ran);
 		strictEqual(entry.score, ran.score);
@@ -158,13 +164,25 @@ describe("vcqa_delta check diff", () => {
 	it("72 → runner error is a transition, not -72", () => {
 		const { scoreChanges, transitions } = diffChecks([scored72], [crashedAudit]);
 		deepStrictEqual(scoreChanges, []);
-		deepStrictEqual(transitions, [{ name: "test-audit", before: "72 (C)", after: "failed (runner error: boom)" }]);
+		deepStrictEqual(transitions, [{ name: "test-audit", before: "72 (C)", after: "failed (runner error)" }]);
 	});
 
 	it("runner error → 72 is a transition too", () => {
 		const { scoreChanges, transitions } = diffChecks([crashedAudit], [scored72]);
 		deepStrictEqual(scoreChanges, []);
-		deepStrictEqual(transitions, [{ name: "test-audit", before: "failed (runner error: boom)", after: "72 (C)" }]);
+		deepStrictEqual(transitions, [{ name: "test-audit", before: "failed (runner error)", after: "72 (C)" }]);
+	});
+
+	it("transition lines never carry the runner-error reason text", () => {
+		const leaky = { ...crashedAudit, details: { ...crashedAudit.details, reason: "runner error: ENOENT /Users/someone/project/x.ts" } };
+		const { transitions } = diffChecks([scored72], [leaky]);
+		strictEqual(transitions[0].after, "failed (runner error)");
+		ok(!JSON.stringify(transitions).includes("/Users/"), "local path leaked into the delta");
+	});
+
+	it("two crashes with different reasons are not a transition", () => {
+		const other = { ...crashedAudit, details: { ...crashedAudit.details, reason: "runner error: different" } };
+		deepStrictEqual(diffChecks([crashedAudit], [other]), { scoreChanges: [], transitions: [] });
 	});
 
 	it("keeps numeric deltas when both sides ran", () => {

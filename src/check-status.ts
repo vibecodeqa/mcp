@@ -67,10 +67,17 @@ export function checkStatus(check: CheckResult): string | undefined {
 	return runnerErrorReason(check) ? "failed" : undefined;
 }
 
+/** First non-empty line of a reason — a crashed runner's message can carry a
+ *  multi-line stack, which does not belong in a one-line label. */
+function firstLine(reason: string): string {
+	return reason.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0) ?? reason.trim();
+}
+
 /** "not run (<reason>)" — the reason when the CLI gave one, else the status. */
 export function notRunLabel(check: CheckResult, status: NotRunStatus): string {
 	const details = isRecord(check.details) ? check.details : {};
-	return `not run (${stringField(details, "reason") ?? status})`;
+	const reason = stringField(details, "reason");
+	return `not run (${reason ? firstLine(reason) : status})`;
 }
 
 /**
@@ -83,7 +90,7 @@ export function placeholderLabel(check: CheckResult): string | null {
 	const notRun = notRunStatus(check);
 	if (notRun) return notRunLabel(check, notRun);
 	const crash = runnerErrorReason(check);
-	if (crash) return `failed (${crash})`;
+	if (crash) return `failed (${firstLine(crash)})`;
 	return null;
 }
 
@@ -120,9 +127,15 @@ export interface CheckDelta {
 	transitions: StatusTransition[];
 }
 
-/** How a check reads on one side of a transition. */
+/**
+ * How a check reads on one side of a `vcqa_delta` transition. A crashed runner
+ * is the short form `failed (runner error)`, matching cli#115: the reason text
+ * varies run to run (so it is not a state worth diffing) and can contain local
+ * paths. The full reason stays in `vcqa_check` / `vcqa_score`.
+ */
 function sideLabel(check: CheckResult | undefined): string {
 	if (!check) return "absent";
+	if (notRunStatus(check) === null && runnerErrorReason(check)) return "failed (runner error)";
 	return placeholderLabel(check) ?? `${check.score} (${check.grade})`;
 }
 
@@ -130,7 +143,7 @@ function sideLabel(check: CheckResult | undefined): string {
  * Per-check comparison for `vcqa_delta`. A numeric delta only exists when both
  * scans produced a real score for the check; otherwise the change is reported as a status transition
  * (e.g. "not run (Set VCQA_PRO_KEY …) → 72 (C)", "72 (C) → failed (runner
- * error: …)"), never as a ±score.
+ * error)"), never as a ±score.
  */
 export function diffChecks(before: CheckResult[], after: CheckResult[]): CheckDelta {
 	const prevByName = new Map(before.map((c) => [c.name, c]));
