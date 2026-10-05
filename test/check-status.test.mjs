@@ -15,7 +15,7 @@ import { describe, it } from "node:test";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { checkResultFields, diffChecks, notRunStatus, scoreEntry } from "../dist/check-status.js";
+import { checkResultFields, checkStatus, diffChecks, notRunStatus, scoreEntry } from "../dist/check-status.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixtureDir = join(here, "fixture");
@@ -44,6 +44,17 @@ const unavailable = byName(checks, "test-audit");
 const skipped = byName(checks, "flutter");
 const ran = byName(checks, "testing");
 
+/** The CLI's crash stub for a runner that threw (cli `core.ts`): status failed,
+ *  a placeholder 0/F, and `skipped` so the composite excludes it. */
+const crashed = {
+	...ran,
+	status: "failed",
+	score: 0,
+	grade: "F",
+	details: { skipped: true, status: "failed", reason: "runner error: boom" },
+	issues: [],
+};
+
 describe("not-run detection", () => {
 	it("the fixture really carries the placeholder 100/A this guards against", () => {
 		strictEqual(unavailable.score, 100);
@@ -64,9 +75,13 @@ describe("not-run detection", () => {
 		strictEqual(notRunStatus({ ...withoutStatus(ran), details: { comingSoon: true } }), "unavailable");
 	});
 
-	it("treats a runner error as a check that ran", () => {
-		const errored = { ...withoutStatus(ran), details: { skipped: true, reason: "runner error: boom" } };
-		strictEqual(notRunStatus(errored), null);
+	it("treats a runner error as a check that ran, with status failed", () => {
+		strictEqual(notRunStatus(crashed), null);
+		strictEqual(checkStatus(crashed), "failed");
+		// Older reports: only the skipped flag and the reason.
+		const legacy = withoutStatus(crashed);
+		strictEqual(notRunStatus(legacy), null);
+		strictEqual(checkStatus(legacy), "failed");
 	});
 });
 
@@ -91,6 +106,18 @@ describe("vcqa_score / vcqa_check entries", () => {
 		ok(entry.result.startsWith("not run (not applicable"), entry.result);
 	});
 
+	for (const [label, check] of [["status", crashed], ["legacy", withoutStatus(crashed)]]) {
+		it(`shows failed (runner error) with no placeholder 0/F for a crashed runner (${label} report)`, () => {
+			for (const entry of [scoreEntry(check), checkResultFields(check)]) {
+				const text = JSON.stringify(entry);
+				strictEqual(entry.score, undefined, text);
+				strictEqual(entry.grade, undefined, text);
+				strictEqual(entry.status, "failed");
+				strictEqual(entry.result, "failed (runner error: boom)");
+			}
+		});
+	}
+
 	it("keeps score and grade for a check that ran", () => {
 		const entry = scoreEntry(ran);
 		strictEqual(entry.score, ran.score);
@@ -102,6 +129,7 @@ describe("vcqa_score / vcqa_check entries", () => {
 
 describe("vcqa_delta check diff", () => {
 	const scored72 = { ...unavailable, status: "passed", score: 72, grade: "C", details: { status: "passed" } };
+	const crashedAudit = { ...crashed, name: "test-audit" };
 
 	it("unavailable → 72 is a transition, not -28 / +28", () => {
 		const { scoreChanges, transitions } = diffChecks([unavailable], [scored72]);
@@ -125,6 +153,18 @@ describe("vcqa_delta check diff", () => {
 		const { scoreChanges, transitions } = diffChecks([withoutStatus(unavailable)], [scored72]);
 		deepStrictEqual(scoreChanges, []);
 		strictEqual(transitions.length, 1);
+	});
+
+	it("72 → runner error is a transition, not -72", () => {
+		const { scoreChanges, transitions } = diffChecks([scored72], [crashedAudit]);
+		deepStrictEqual(scoreChanges, []);
+		deepStrictEqual(transitions, [{ name: "test-audit", before: "72 (C)", after: "failed (runner error: boom)" }]);
+	});
+
+	it("runner error → 72 is a transition too", () => {
+		const { scoreChanges, transitions } = diffChecks([crashedAudit], [scored72]);
+		deepStrictEqual(scoreChanges, []);
+		deepStrictEqual(transitions, [{ name: "test-audit", before: "failed (runner error: boom)", after: "72 (C)" }]);
 	});
 
 	it("keeps numeric deltas when both sides ran", () => {

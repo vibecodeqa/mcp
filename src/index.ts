@@ -177,7 +177,7 @@ server.tool(
 	// which counts what the *schema* documents, not what the *engine* emits — the
 	// pinned CLI reports 38 checks against the pinned schema's 37 (it has no entry
 	// for `dead-code`), so any number stated here is advertised as fact and wrong.
-	"Run a full code health scan. Returns score, grade, and every check result with its issues. Use vcqa_score for a quicker summary.",
+	"Run a full code health scan. Returns score, grade, and every check result with its issues. Read each check's `status`: a check with status skipped/unavailable did not run, and a failed check whose reason starts with \"runner error:\" crashed — in both cases its score and grade are placeholders, not measurements. Use vcqa_score for a quicker summary.",
 	{ path: z.string().optional().describe("Project directory path (defaults to cwd)") },
 	async ({ path }) => {
 		const cwd = path || process.cwd();
@@ -425,6 +425,7 @@ server.tool(
 			for (const t of transitions.slice(0, 10)) {
 				text += `  ${t.name}: ${t.before} → ${t.after}\n`;
 			}
+			if (transitions.length > 10) text += `  (+${transitions.length - 10} more)\n`;
 			text += "\n";
 		}
 		if (fixedSamples.length > 0) text += `Fixed examples: ${fixedSamples.join(", ")}\n`;

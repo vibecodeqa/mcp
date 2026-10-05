@@ -25,14 +25,25 @@ function stringField(obj: Record<string, unknown>, key: string): string | undefi
 	return typeof v === "string" && v.length > 0 ? v : undefined;
 }
 
+/** The `"runner error: …"` reason when the check's runner crashed, else `null`. */
+export function runnerErrorReason(check: CheckResult): string | null {
+	const details = isRecord(check.details) ? check.details : {};
+	const reason = stringField(details, "reason");
+	return reason?.startsWith("runner error:") ? reason : null;
+}
+
 /**
  * `"skipped"` / `"unavailable"` when the check did not run, otherwise `null`.
  *
  * Prefers the normalized `status` the CLI writes on the check (and mirrors in
  * `details`). Reports from CLIs that predate that field are derived from the
- * detail flags, as github-app `metric-history.ts` does. A `"runner error:"`
- * reason is deliberately not a non-run: the check executed and failed, and its
- * score is a real data point.
+ * detail flags, as github-app `metric-history.ts` does.
+ *
+ * A `"runner error:"` reason is not a non-run: the check started and crashed,
+ * so it counts as RAN with status `failed` (the CLI's own `checkAvailabilityStatus`,
+ * cli#115). Its `0 / F` is still a placeholder, though — the CLI flags it
+ * `skipped` so the composite score excludes it — which is what
+ * `placeholderLabel` handles.
  */
 export function notRunStatus(check: CheckResult): NotRunStatus | null {
 	const details = isRecord(check.details) ? check.details : {};
@@ -40,8 +51,7 @@ export function notRunStatus(check: CheckResult): NotRunStatus | null {
 	if (status === "skipped" || status === "unavailable") return status;
 	if (status) return null;
 
-	const reason = stringField(details, "reason") ?? "";
-	if (reason.startsWith("runner error:")) return null;
+	if (runnerErrorReason(check)) return null;
 	if (details.unavailable || details.comingSoon) return "unavailable";
 	if (details.skipped) return "skipped";
 	return null;
@@ -52,7 +62,9 @@ export function checkStatus(check: CheckResult): string | undefined {
 	const derived = notRunStatus(check);
 	if (derived) return derived;
 	const details = isRecord(check.details) ? check.details : {};
-	return stringField(check as unknown as Record<string, unknown>, "status") ?? stringField(details, "status");
+	const reported = stringField(check as unknown as Record<string, unknown>, "status") ?? stringField(details, "status");
+	if (reported) return reported;
+	return runnerErrorReason(check) ? "failed" : undefined;
 }
 
 /** "not run (<reason>)" — the reason when the CLI gave one, else the status. */
@@ -61,21 +73,30 @@ export function notRunLabel(check: CheckResult, status: NotRunStatus): string {
 	return `not run (${stringField(details, "reason") ?? status})`;
 }
 
-/** One line of `vcqa_score`: score/grade only for a check that ran. */
-export function scoreEntry(check: CheckResult): Record<string, unknown> {
-	const status = checkStatus(check);
+/**
+ * When the check's score/grade is a placeholder rather than a measurement,
+ * the label to show instead — `"not run (<reason>)"` for a skipped/unavailable
+ * check, `"failed (runner error: …)"` for a crashed runner. `null` means the
+ * score is real.
+ */
+export function placeholderLabel(check: CheckResult): string | null {
 	const notRun = notRunStatus(check);
-	if (notRun) {
-		return { name: check.name, status, result: notRunLabel(check, notRun), issues: check.issues.length };
-	}
-	return { name: check.name, ...(status ? { status } : {}), score: check.score, grade: check.grade, issues: check.issues.length };
+	if (notRun) return notRunLabel(check, notRun);
+	const crash = runnerErrorReason(check);
+	if (crash) return `failed (${crash})`;
+	return null;
 }
 
-/** The score/grade (or not-run) part of `vcqa_check`'s output. */
+/** One line of `vcqa_score`: score/grade only when the score is real. */
+export function scoreEntry(check: CheckResult): Record<string, unknown> {
+	return { name: check.name, ...checkResultFields(check), issues: check.issues.length };
+}
+
+/** The score/grade (or placeholder label) part of `vcqa_check`'s output. */
 export function checkResultFields(check: CheckResult): Record<string, unknown> {
 	const status = checkStatus(check);
-	const notRun = notRunStatus(check);
-	if (notRun) return { status, result: notRunLabel(check, notRun) };
+	const label = placeholderLabel(check);
+	if (label) return { status, result: label };
 	return { ...(status ? { status } : {}), score: check.score, grade: check.grade };
 }
 
@@ -93,24 +114,23 @@ export interface StatusTransition {
 }
 
 export interface CheckDelta {
-	/** Both sides ran and the score moved — a real numeric delta. */
+	/** Both sides have a real score and it moved — a numeric delta. */
 	scoreChanges: ScoreChange[];
-	/** At least one side did not run (or the check is absent): no number. */
+	/** At least one side did not run, crashed, or is absent: no number. */
 	transitions: StatusTransition[];
 }
 
 /** How a check reads on one side of a transition. */
 function sideLabel(check: CheckResult | undefined): string {
 	if (!check) return "absent";
-	const notRun = notRunStatus(check);
-	if (notRun) return notRunLabel(check, notRun);
-	return `${check.score} (${check.grade})`;
+	return placeholderLabel(check) ?? `${check.score} (${check.grade})`;
 }
 
 /**
  * Per-check comparison for `vcqa_delta`. A numeric delta only exists when both
- * scans ran the check; otherwise the change is reported as a status transition
- * (e.g. "not run (Set VCQA_PRO_KEY …) → 72 (C)"), never as a ±score.
+ * scans produced a real score for the check; otherwise the change is reported as a status transition
+ * (e.g. "not run (Set VCQA_PRO_KEY …) → 72 (C)", "72 (C) → failed (runner
+ * error: …)"), never as a ±score.
  */
 export function diffChecks(before: CheckResult[], after: CheckResult[]): CheckDelta {
 	const prevByName = new Map(before.map((c) => [c.name, c]));
@@ -120,9 +140,9 @@ export function diffChecks(before: CheckResult[], after: CheckResult[]): CheckDe
 
 	for (const curr of after) {
 		const prev = prevByName.get(curr.name);
-		const prevRan = prev !== undefined && notRunStatus(prev) === null;
-		const currRan = notRunStatus(curr) === null;
-		if (prevRan && currRan) {
+		const prevScored = prev !== undefined && placeholderLabel(prev) === null;
+		const currScored = placeholderLabel(curr) === null;
+		if (prevScored && currScored) {
 			const delta = curr.score - prev.score;
 			if (delta !== 0) scoreChanges.push({ name: curr.name, before: prev.score, after: curr.score, delta });
 			continue;
