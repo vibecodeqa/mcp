@@ -19,7 +19,8 @@
 
 import { deepStrictEqual, ok, strictEqual } from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { accessSync, constants, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, constants, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { after, before, describe, it } from "node:test";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -229,6 +230,40 @@ describe("mcp stdio smoke test", () => {
 			arguments: { path: fixtureDir, file: "../../package.json" },
 		});
 		ok(result.isError, "path escape should be rejected");
+	});
+
+	it("shows 'not run' instead of 100/A for an unavailable check in vcqa_score and vcqa_check (#8)", async () => {
+		// Offline: runScan() serves a fresh `.vibe-check/report.json` from disk
+		// instead of spawning the engine, so the committed fixture report goes
+		// through the real tool handlers with no network.
+		const project = mkdtempSync(join(tmpdir(), "vcqa-mcp-status-"));
+		try {
+			const fixture = readdirSync(fixtureDir).find((f) => /^report-cli-.*\.json$/.test(f));
+			mkdirSync(join(project, ".vibe-check"));
+			writeFileSync(join(project, ".vibe-check", "report.json"), readFileSync(join(fixtureDir, fixture)));
+
+			const score = JSON.parse(resultText(await client.request("tools/call", {
+				name: "vcqa_score",
+				arguments: { path: project },
+			})));
+			const entry = score.checks.find((c) => c.name === "test-audit");
+			ok(entry, "test-audit missing from vcqa_score");
+			strictEqual(entry.status, "unavailable");
+			strictEqual(entry.score, undefined, JSON.stringify(entry));
+			strictEqual(entry.grade, undefined, JSON.stringify(entry));
+			ok(entry.result.startsWith("not run ("), JSON.stringify(entry));
+
+			const check = JSON.parse(resultText(await client.request("tools/call", {
+				name: "vcqa_check",
+				arguments: { path: project, check: "test-audit" },
+			})));
+			strictEqual(check.status, "unavailable");
+			strictEqual(check.score, undefined, JSON.stringify(check));
+			strictEqual(check.grade, undefined, JSON.stringify(check));
+			ok(check.result.startsWith("not run ("), JSON.stringify(check));
+		} finally {
+			rmSync(project, { recursive: true, force: true });
+		}
 	});
 
 	it("explains a check without running a scan", async () => {
