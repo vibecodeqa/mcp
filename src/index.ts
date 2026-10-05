@@ -65,6 +65,7 @@ import { dirname, extname, join, relative, resolve } from "node:path";
 import { buildArchitecture, stripHiddenNodes, type GraphifyGraph } from "./architecture.js";
 import { buildCallGraph, entryPoints, resolveRootMatches, traceFrom } from "./callflow.js";
 import { buildSequence, toMermaid } from "./sequence.js";
+import { checkResultFields, diffChecks, scoreEntry } from "./check-status.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CHECK_META, parseReport, type VibeReport } from "@vibecodeqa/schema";
@@ -160,12 +161,9 @@ server.tool(
 					score: report.score,
 					grade: report.grade,
 					summary: `${report.grade} ${report.score}/100`,
-					checks: report.checks.map(c => ({
-						name: c.name,
-						score: c.score,
-						grade: c.grade,
-						issues: c.issues.length,
-					})),
+					// A check that did not run carries a placeholder 100/A — show
+					// "not run (<reason>)" instead of a score it never earned (#8).
+					checks: report.checks.map(scoreEntry),
 				}, null, 2),
 			}],
 		};
@@ -179,7 +177,7 @@ server.tool(
 	// which counts what the *schema* documents, not what the *engine* emits — the
 	// pinned CLI reports 38 checks against the pinned schema's 37 (it has no entry
 	// for `dead-code`), so any number stated here is advertised as fact and wrong.
-	"Run a full code health scan. Returns score, grade, and every check result with its issues. Use vcqa_score for a quicker summary.",
+	"Run a full code health scan. Returns score, grade, and every check result with its issues. Read each check's `status`: a check with status skipped/unavailable did not run, and a failed check whose reason starts with \"runner error:\" crashed — in both cases its score and grade are placeholders, not measurements. Use vcqa_score for a quicker summary.",
 	{ path: z.string().optional().describe("Project directory path (defaults to cwd)") },
 	async ({ path }) => {
 		const cwd = path || process.cwd();
@@ -231,7 +229,7 @@ server.tool(
 // ── Tool: vcqa_check ──
 server.tool(
 	"vcqa_check",
-	"Get detailed results for a specific check (e.g., 'complexity', 'security', 'testing'). Shows score, issues, and metadata.",
+	"Get detailed results for a specific check (e.g., 'complexity', 'security', 'testing'). Shows status, score, issues, and metadata. A check that did not run (skipped/unavailable) has no score.",
 	{
 		check: z.string().describe("Check name (e.g., 'complexity', 'security', 'testing', 'architecture')"),
 		path: z.string().optional().describe("Project directory path (defaults to cwd)"),
@@ -255,8 +253,7 @@ server.tool(
 				text: JSON.stringify({
 					name: c.name,
 					label: meta?.label || c.name,
-					score: c.score,
-					grade: c.grade,
+					...checkResultFields(c),
 					category: meta?.category,
 					weight: meta ? `${meta.weight}%` : undefined,
 					details: c.details,
@@ -409,13 +406,9 @@ server.tool(
 		}
 
 		const scoreDelta = currentReport.score - prevReport.score;
-		const checkChanges = currentReport.checks
-			.map((c) => {
-				const prev = prevReport!.checks.find((p) => p.name === c.name);
-				return { name: c.name, before: prev?.score ?? 0, after: c.score, delta: c.score - (prev?.score ?? 0) };
-			})
-			.filter((c: { delta: number }) => c.delta !== 0)
-			.sort((a: { delta: number }, b: { delta: number }) => b.delta - a.delta);
+		// Numeric deltas only where both scans ran the check; anything involving
+		// a skipped/unavailable/absent side is a status transition (#8).
+		const { scoreChanges: checkChanges, transitions } = diffChecks(prevReport.checks, currentReport.checks);
 
 		let text = `Score: ${prevReport.grade} ${prevReport.score} → ${currentReport.grade} ${currentReport.score} (${scoreDelta > 0 ? "+" : ""}${scoreDelta})\n`;
 		text += `Fixed: ${fixedCount} issues | New: ${newCount} issues\n\n`;
@@ -425,6 +418,14 @@ server.tool(
 			for (const c of checkChanges.slice(0, 10)) {
 				text += `  ${c.delta > 0 ? "+" : ""}${c.delta} ${c.name} (${c.before} → ${c.after})\n`;
 			}
+			text += "\n";
+		}
+		if (transitions.length > 0) {
+			text += "Status changes:\n";
+			for (const t of transitions.slice(0, 10)) {
+				text += `  ${t.name}: ${t.before} → ${t.after}\n`;
+			}
+			if (transitions.length > 10) text += `  (+${transitions.length - 10} more)\n`;
 			text += "\n";
 		}
 		if (fixedSamples.length > 0) text += `Fixed examples: ${fixedSamples.join(", ")}\n`;

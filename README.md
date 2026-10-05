@@ -60,7 +60,18 @@ So adding a tool here gives it to Claude Code *and* the Copilot at once.
 | `vcqa_check` | Detailed results for one check (e.g., "complexity") |
 | `vcqa_explain` | What a check measures, why it matters, how to fix |
 | `vcqa_fix` | AI-powered fix for code issues (needs ANTHROPIC_API_KEY) |
-| `vcqa_delta` | Compare current scan vs previous — shows fixed/new issues |
+| `vcqa_delta` | Compare current scan vs previous — shows fixed/new issues, per-check score deltas, and status changes |
+
+Each check entry in `vcqa_score` and `vcqa_check` carries a `status`. When the
+check's score is a placeholder rather than a measurement, the entry has **no
+`score` or `grade`** and a `result` label instead. That covers checks that
+did not run (`skipped` / `unavailable` → `"not run (<reason>)"`) and checks
+whose runner crashed (`failed` → `"failed (runner error: …)"`). `vcqa_delta`
+gives a numeric delta only when both scans have a real score, and lists
+anything else as a status change. A crashed runner shows there as the short form
+`failed (runner error)`, without the reason text, because that text varies
+between runs and can contain local paths. `vcqa_scan` returns the raw report, where
+those checks still carry the CLI's placeholder score, so read `status` there.
 
 **Code** (read the same source the monitor shows):
 
