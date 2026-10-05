@@ -12,8 +12,8 @@ importers:
         specifier: ^1.30.0
         version: 1.30.0(zod@3.25.76)
       '@vibecodeqa/schema':
-        specifier: ^0.5.0
-        version: 0.5.0
+        specifier: ^0.6.0
+        version: 0.6.0
       zod:
         specifier: ^3.25.76
         version: 3.25.76
@@ -46,8 +46,8 @@ packages:
   '@types/node@22.20.1':
     resolution: {integrity: sha512-EANqOCF9QFyra+4pfxUcX9STKJpCLjMbObVzljIJomAWSnuSIEAvyzEU53GaajbXJEgdh0iEcPL+DGvpUd4k1Q==}
 
-  '@vibecodeqa/schema@0.5.0':
-    resolution: {integrity: sha512-ZEWpF5DONA8luS9id3clOiDPFxYSXDdJa6BS+sr3f8ynYjEGMP9JwNXn5kkD0Mt8ndVmYqqGfP4ZrkC8l/qIsg==}
+  '@vibecodeqa/schema@0.6.0':
+    resolution: {integrity: sha512-ryuQJ36GVogYPGOQ+wyjeRhAtO5ZsAlS9r588M9IwxM3s5GAnQyDUB87wfES+LLAlied/xooMwBIAtcmXh3/Jw==}
     engines: {node: '>=20'}
 
   accepts@2.0.0:
@@ -444,7 +444,7 @@ snapshots:
     dependencies:
       undici-types: 6.21.0
 
-  '@vibecodeqa/schema@0.5.0':
+  '@vibecodeqa/schema@0.6.0':
     dependencies:
       zod: 3.25.76
 
